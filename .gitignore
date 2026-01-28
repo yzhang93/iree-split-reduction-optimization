@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Results and temporary files
+*.csv
+*.json
+*_results/
+results_archive_*/
+
+# Backup files
+*.backup
+*.bak
+*.cpp.bak
+*.orig
+
+# Temporary scripts
+_run_benchmark_*.sh
+temp_*.py
+test_*.sh.tmp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Keep test data files
+!test_list.txt
+!small_test.txt
+!*_shapes*.txt
