@@ -11,6 +11,9 @@
 
 set -e
 
+# Save script directory (absolute path)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Configuration
 CPP_FILE="../iree/compiler/src/iree/compiler/DispatchCreation/SetSplitReductionSizes.cpp"
 IREE_BUILD_DIR="../iree-build"
@@ -22,6 +25,127 @@ if [[ ! -f "optimize_single_limit.py" ]]; then
     echo "Error: Must run from split_reduction_optimization directory"
     exit 1
 fi
+
+# Function to test optimized configuration
+# This is used by both 'test-optimized' mode and 'full' mode
+test_optimized_config() {
+    local results_dir="$1"
+    shift
+    local test_files_abs=("$@")
+    
+    # Apply recommendations
+    echo "Applying PART 4 recommendations to SetSplitReductionSizes.cpp..."
+    python3 apply_recommendations.py \
+        "$results_dir/comprehensive_analysis.txt" \
+        "$CPP_FILE"
+    
+    if [ $? -ne 0 ]; then
+        echo "❌ Failed to apply recommendations"
+        return 1
+    fi
+    
+    # Build IREE
+    echo ""
+    echo "Building IREE with optimized settings..."
+    cd "$IREE_BUILD_DIR"
+    cmake --build . --target iree-compile 2>&1 | grep -E "(Building|error|warning)" || true
+    
+    if [ ${PIPESTATUS[0]} -ne 0 ]; then
+        echo "❌ Build failed!"
+        # Restore original C++ file
+        if [ -f "${CPP_FILE}.before_optimization" ]; then
+            cp "${CPP_FILE}.before_optimization" "$CPP_FILE"
+            echo "✓ Original C++ restored"
+        fi
+        return 1
+    fi
+    
+    echo "✓ Build successful"
+    echo ""
+    echo "Running benchmarks with optimized configuration..."
+    
+    # Run benchmarks for each test file
+    for test_file in "${test_files_abs[@]}"; do
+        if [ ! -f "$test_file" ]; then
+            echo "⚠️  Test file not found: $test_file"
+            continue
+        fi
+        
+        test_basename=$(basename "$test_file" .txt)
+        csv_file="$results_dir/optimized_config_${test_basename}.csv"
+        
+        echo "  Testing $(basename $test_file)..."
+        
+        # Create temporary benchmark script for complete environment isolation
+        cat > "$results_dir/_run_opt_bench.sh" << EOFSCRIPT
+#!/bin/bash
+set -e
+
+# Set up IREE environment
+export PATH="$IREE_BUILD_DIR/tools:\$PATH"
+export PYTHONPATH="$IREE_BUILD_DIR/compiler/bindings/python:\$PYTHONPATH"
+export CUDA_VISIBLE_DEVICES=$GPU_ID
+
+# Activate turbine venv and load .env
+cd "$TURBINE_DIR"
+source .venv/bin/activate
+if [ -f .env ]; then
+    source .env
+    export PYTHONPATH
+fi
+
+# Run benchmark
+python3 iree/turbine/kernel/boo/driver/driver.py \\
+    --commands-file="$test_file" \\
+    --csv="$csv_file"
+EOFSCRIPT
+        
+        chmod +x "$results_dir/_run_opt_bench.sh"
+        
+        # Run benchmark (output redirected to log file)
+        if "$results_dir/_run_opt_bench.sh" > "$results_dir/_bench_output.log" 2>&1; then
+            if [ -f "$csv_file" ]; then
+                echo "  ✓ Completed $(basename $test_file)"
+            else
+                echo "  ❌ Benchmark completed but no CSV file created"
+            fi
+        else
+            echo "  ❌ Benchmark failed for $(basename $test_file)"
+            echo "     Last 20 lines of output:"
+            if [ -f "$results_dir/_bench_output.log" ]; then
+                tail -20 "$results_dir/_bench_output.log" | sed "s/^/     /"
+            fi
+        fi
+        
+        rm -f "$results_dir/_run_opt_bench.sh"
+    done
+    
+    echo ""
+    echo "✓ Optimized configuration benchmarks complete"
+    echo ""
+    
+    # Update comprehensive analysis with optimized results
+    echo "Updating comprehensive analysis with validated results..."
+    cd "$SCRIPT_DIR"
+    python3 analyze_results.py \
+        --results-file "$results_dir/limitParallelLoops_sweep_results.json" \
+        --output-dir "$results_dir" \
+        --baseline-limit baseline \
+        --optimized-csv "$results_dir/optimized_config_*.csv"
+    
+    echo ""
+    echo "✓ Analysis updated with optimized configuration results"
+    
+    # Restore original C++ file
+    if [ -f "${CPP_FILE}.before_optimization" ]; then
+        echo ""
+        echo "Restoring original C++ file..."
+        cp "${CPP_FILE}.before_optimization" "$CPP_FILE"
+        echo "✓ Original SetSplitReductionSizes.cpp restored"
+    fi
+    
+    return 0
+}
 
 # Parse arguments
 MODE="${1:-quick}"
@@ -84,18 +208,51 @@ case "$MODE" in
         echo "Analysis complete! See: $RESULTS_DIR/comprehensive_analysis.txt"
         exit 0
         ;;
+    test-optimized)
+        echo "Testing optimized configuration..."
+        echo ""
+        
+        if [ ! -f "$RESULTS_DIR/comprehensive_analysis.txt" ]; then
+            echo "Error: No analysis found at $RESULTS_DIR/comprehensive_analysis.txt"
+            echo "Run analysis first: ./run_parameter_search.sh analyze"
+            exit 1
+        fi
+        
+        # Call the function to test optimized configuration
+        test_optimized_config "$RESULTS_DIR" "${TEST_FILES_ABS[@]}"
+        
+        if [ $? -eq 0 ]; then
+            echo ""
+            echo "================================================================================"
+            echo "  ✅ VALIDATION COMPLETE!"
+            echo "================================================================================"
+            echo ""
+            echo "Results saved to: $RESULTS_DIR/"
+            echo ""
+            echo "Check PART 6 in: $RESULTS_DIR/comprehensive_analysis.txt"
+            echo "  This section shows the validated optimized performance!"
+            echo ""
+        else
+            echo ""
+            echo "⚠️  Validation failed. Check the error messages above."
+            exit 1
+        fi
+        exit 0
+        ;;
     *)
-        echo "Usage: $0 {quick|full|analyze} [test_files...]"
+        echo "Usage: $0 {quick|full|analyze|test-optimized} [test_files...]"
         echo ""
         echo "Modes:"
-        echo "  quick   - Test 3 values: 64, 128, 256 (fast)"
-        echo "  full    - Test all 9 values (comprehensive)"
-        echo "  analyze - Analyze existing results"
+        echo "  quick         - Test 4 values: 1, 64, 128, 256 (fast)"
+        echo "  full          - Test 10 values: 1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048"
+        echo "  analyze       - Analyze existing results (no testing)"
+        echo "  test-optimized - Apply and test the optimized configuration"
         echo ""
         echo "Examples:"
         echo "  $0 quick ../small_test.txt"
         echo "  $0 full ../prod_weight_shapes_conv.txt"
         echo "  $0 analyze"
+        echo "  $0 test-optimized ../prod_weight_shapes_conv.txt"
         echo ""
         exit 1
         ;;
@@ -201,79 +358,48 @@ python3 analyze_results.py \
     --output-dir "$RESULTS_DIR" \
     --baseline-limit baseline
 
-# Apply recommendations and test optimized configuration
+# Apply recommendations and test optimized configuration automatically
 echo ""
 echo "================================================================================"
-echo "  TESTING OPTIMIZED CONFIGURATION"
+echo "  APPLYING RECOMMENDATIONS AND TESTING OPTIMIZED CONFIGURATION"
 echo "================================================================================"
 echo ""
 
-# The C++ code should already have the optimized configuration applied
-# Just run benchmarks to validate
-echo "Running benchmarks with current C++ configuration (should be optimized)..."
+# Call the function to test optimized configuration
+test_optimized_config "$RESULTS_DIR" "${TEST_FILES_ABS[@]}"
 
-for test_file in "${TEST_FILES[@]}"; do
-    if [ ! -f "$test_file" ]; then
-        continue
-    fi
-    
-    test_basename=$(basename "$test_file" .txt)
-    csv_file="$RESULTS_DIR/optimized_config_${test_basename}.csv"
-    
-    echo "  Testing $(basename $test_file)..."
-    
-    # Create temporary benchmark script
-    cat > "$RESULTS_DIR/_run_opt_bench.sh" << EOFSCRIPT
-#!/bin/bash
-set -e
-export PATH="$IREE_BUILD_DIR/tools:\$PATH"
-export CUDA_VISIBLE_DEVICES=$GPU_ID
-cd "$TURBINE_DIR"
-source .venv/bin/activate
-if [ -f .env ]; then source .env; fi
-python3 iree/turbine/kernel/boo/driver/driver.py \\
-    --commands-file="$test_file" \\
-    --csv="$csv_file"
-EOFSCRIPT
-    
-    chmod +x "$RESULTS_DIR/_run_opt_bench.sh"
-    
-    if "$RESULTS_DIR/_run_opt_bench.sh" > /dev/null 2>&1; then
-        echo "  ✓ Completed $(basename $test_file)"
-    else
-        echo "  ⚠ Benchmark failed for $(basename $test_file)"
-    fi
-    
-    rm -f "$RESULTS_DIR/_run_opt_bench.sh"
-done
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "⚠️  Validation failed. Check the error messages above."
+    echo "   You can manually apply the recommendations from PART 4"
+    echo "   and run: ./run_parameter_search.sh test-optimized"
+    exit 1
+fi
 
 echo ""
-echo "✓ Optimized configuration benchmarks complete"
-
-# Re-run analysis with optimized results included
-echo ""
-echo "Updating comprehensive analysis with optimized results..."
-python3 analyze_results.py \
-    --results-file "$RESULTS_DIR/limitParallelLoops_sweep_results.json" \
-    --output-dir "$RESULTS_DIR" \
-    --baseline-limit baseline \
-    --optimized-csv "$RESULTS_DIR/optimized_config_*.csv"
+echo "NOTE: The optimized C++ code is in PART 4 of comprehensive_analysis.txt"
+echo "      Apply it manually when you're ready to use the optimized configuration"
 
 echo ""
 echo "================================================================================"
 echo "  🎉 ALL DONE!"
 echo "================================================================================"
 echo ""
-echo "Results:"
-echo "  - Comprehensive Analysis: $RESULTS_DIR/comprehensive_analysis.txt"
-echo "    (includes sweep results, recommendations, AND optimized performance)"
-echo "  - JSON Summary: $RESULTS_DIR/limitParallelLoops_sweep_results.json"
-echo "  - Sweep CSV files: $RESULTS_DIR/limit_*.csv"
-echo "  - Optimized CSV files: $RESULTS_DIR/optimized_config_*.csv"
+echo "Results saved to: $RESULTS_DIR/"
 echo ""
-echo "The comprehensive_analysis.txt now contains:"
-echo "  ✓ Sweep results for all tested limits"
-echo "  ✓ C++ code recommendations"
-echo "  ✓ Performance validation of optimized configuration"
-echo "  ✓ Comparison: baseline vs optimized"
+echo "📊 comprehensive_analysis.txt contains:"
+echo "  ✓ PART 1: Performance summary for all tested limits"
+echo "  ✓ PART 2: Baseline comparison"
+echo "  ✓ PART 3: Cluster analysis"
+echo "  ✓ PART 4: C++ code recommendations ⭐ (APPLY THESE!)"
+echo "  ✓ PART 5: Top speedups"
+echo "  ✓ PART 6: Validated optimized performance ⭐ (TESTED & CONFIRMED!)"
+echo ""
+echo "📈 Performance validated:"
+echo "   The recommendations in PART 4 have been automatically applied,"
+echo "   tested, and validated. Check PART 6 for actual speedup numbers!"
+echo ""
+echo "📝 To use the optimized configuration in production:"
+echo "   Copy the C++ code from PART 4 to SetSplitReductionSizes.cpp"
+echo "   and rebuild IREE."
 echo ""

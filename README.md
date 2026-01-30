@@ -67,9 +67,10 @@ split_reduction_optimization/
 ├── QUICKSTART.md                  ← User guide
 ├── IMPLEMENTATION.md              ← Technical details
 │
-├── run_parameter_search.sh        ← Main script (run this!)
+├── run_parameter_search.sh        ← Main script (all modes: quick|full|analyze|test-optimized)
 ├── optimize_single_limit.py       ← Tests single limit in isolation
 ├── analyze_results.py             ← Comprehensive analysis + validation
+├── apply_recommendations.py       ← Applies Part 4 recommendations to C++
 ├── create_json_summary.py         ← Aggregates CSV results
 │
 ├── check_setup.sh                 ← Verify environment

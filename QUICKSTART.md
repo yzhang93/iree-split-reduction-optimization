@@ -45,8 +45,10 @@ Expected output:
 ```
 
 **Modes:**
-- `quick` - Tests 3 limits (64, 128, 256) - ~5 minutes
-- `full` - Tests 11 limits (baseline, 1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048) - ~1 hour
+- `quick` - Tests 4 limits (1, 64, 128, 256) + baseline - ~5 minutes
+- `full` - Tests 10 limits (1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048) + baseline - ~1 hour
+- `analyze` - Re-analyze existing results without re-running tests
+- `test-optimized` - Apply and test the recommended configuration
 
 ### Examples
 
@@ -54,23 +56,36 @@ Expected output:
 # Quick test for fast iteration
 ./run_parameter_search.sh quick ~/small_test.txt
 
-# Full sweep for production
+# Full sweep for production (includes automatic validation)
 ./run_parameter_search.sh full ~/prod_weight_shapes_conv.txt
 
-# Test both convolution and matmul
-./run_parameter_search.sh full ~/all_operations.txt
+# Re-analyze without re-running benchmarks
+./run_parameter_search.sh analyze
+
+# Test only the optimized configuration (after analysis)
+./run_parameter_search.sh test-optimized ~/prod_weight_shapes_conv.txt
 ```
 
 ### What Happens
 
-The script will:
+**`quick` and `full` modes:**
 1. ✓ Run baseline benchmark (original C++ code)
-2. ✓ Test each limit value in a separate process
+2. ✓ Test each limit value in a separate process (complete isolation)
 3. ✓ Generate JSON summary of all results
 4. ✓ Analyze results and create C++ recommendations
-5. ✓ **Test the optimized configuration**
+5. ✓ **Automatically apply recommendations and test optimized configuration**
 6. ✓ **Validate performance vs baseline**
-7. ✓ Generate comprehensive analysis report
+7. ✓ Generate comprehensive analysis report with Part 6 validation
+
+**`analyze` mode:**
+- Re-analyze existing results without re-running tests
+- Update comprehensive_analysis.txt with latest analysis logic
+
+**`test-optimized` mode:**
+- Apply Part 4 recommendations from comprehensive_analysis.txt
+- Build IREE with optimized configuration
+- Run benchmarks and validate performance
+- Update comprehensive_analysis.txt with Part 6 results
 
 **All results saved to:** `../<test_name>_results/` (derived from input file name)
 
@@ -246,11 +261,18 @@ Run your benchmarks and compare against Part 6 of the analysis to confirm the im
 # Creates: *_conv.txt and *_matmul.txt
 ```
 
-### Force Re-run
+### Re-analyze Existing Results
 
 ```bash
-# Regenerate results even if they exist
-./run_parameter_search.sh full ~/test.txt --force-rerun
+# Update analysis without re-running benchmarks
+./run_parameter_search.sh analyze
+```
+
+### Test Specific Configuration
+
+```bash
+# Only test the optimized configuration (requires existing analysis)
+./run_parameter_search.sh test-optimized ~/test.txt
 ```
 
 ### Specify GPU
@@ -258,6 +280,19 @@ Run your benchmarks and compare against Part 6 of the analysis to confirm the im
 ```bash
 # Edit GPU_ID in run_parameter_search.sh
 GPU_ID=5  # Default
+```
+
+### Smart Caching
+
+By default, if result files already exist, the script skips re-running them:
+- Speeds up interrupted runs
+- Allows testing different test files incrementally
+- To force re-run a specific limit, delete its CSV file manually
+
+```bash
+# Example: Force re-run baseline only
+rm ../prod_weight_shapes_results/limit_baseline_*.csv
+./run_parameter_search.sh full ~/prod_weight_shapes_conv.txt
 ```
 
 ---
@@ -366,14 +401,24 @@ cp -r ../prod_weight_shapes_results ../results_archive_$TIMESTAMP
 ## Performance Expectations
 
 ### Quick Mode (~5 minutes)
-- Tests: 3 limits
+- Tests: 4 limits (1, 64, 128, 256) + baseline
 - Good for: Fast iteration, verification
 - Use when: Developing, debugging, testing changes
 
 ### Full Mode (~1 hour)
-- Tests: 11 limits (including baseline and limit=1)
+- Tests: 10 limits (1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048) + baseline + optimized validation
 - Good for: Production optimization
 - Use when: Final optimization, benchmarking for deployment
+
+### Analyze Mode (~10 seconds)
+- No new tests: Re-analyzes existing results only
+- Good for: Testing analysis improvements, quick insights
+- Use when: Results exist but want updated analysis
+
+### Test-Optimized Mode (~10 minutes)
+- Tests: Only the recommended optimized configuration
+- Good for: Validating recommendations, quick verification
+- Use when: Want to validate specific recommendations without full sweep
 
 ### Expected Improvements
 Based on validated results:

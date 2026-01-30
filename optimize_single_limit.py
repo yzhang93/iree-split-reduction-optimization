@@ -272,8 +272,9 @@ TURBINE_DIR="{self.turbine_dir.resolve()}"
 TEST_FILE="{test_file.resolve()}"
 CSV_FILE="{csv_file.resolve()}"
 
-# Setup PATH for IREE tools
+# Setup IREE environment
 export PATH="$IREE_BUILD_DIR/tools:$PATH"
+export PYTHONPATH="$IREE_BUILD_DIR/compiler/bindings/python:$PYTHONPATH"
 
 # Set GPU
 export CUDA_VISIBLE_DEVICES={self.gpu_id}

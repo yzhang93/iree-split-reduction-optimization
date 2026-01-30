@@ -4,6 +4,56 @@
 
 The toolkit uses an **isolated process architecture** with integrated validation, where each `limitParallelLoops` value is tested in a separate Python process to avoid import caching issues.
 
+### Workflow Modes
+
+The main script (`run_parameter_search.sh`) supports 4 modes:
+
+#### Mode 1: `quick` (Fast Iteration)
+```
+./run_parameter_search.sh quick test.txt
+
+1. Baseline → optimize_single_limit.py --baseline
+2. Sweep → Test limits: 1, 64, 128, 256 (4 limits)
+3. Aggregate → create_json_summary.py
+4. Analyze → analyze_results.py
+5. Validate → test_optimized_config() [built-in function]
+6. Update → analyze_results.py --optimized-csv
+```
+
+#### Mode 2: `full` (Production Optimization)
+```
+./run_parameter_search.sh full test.txt
+
+1. Baseline → optimize_single_limit.py --baseline
+2. Sweep → Test limits: 1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048 (10 limits)
+3. Aggregate → create_json_summary.py
+4. Analyze → analyze_results.py
+5. Validate → test_optimized_config() [built-in function]
+6. Update → analyze_results.py --optimized-csv
+```
+
+#### Mode 3: `analyze` (Re-analyze Only)
+```
+./run_parameter_search.sh analyze
+
+→ analyze_results.py (using existing JSON)
+→ Updates comprehensive_analysis.txt
+→ No new benchmarks run
+```
+
+#### Mode 4: `test-optimized` (Validate Specific Config)
+```
+./run_parameter_search.sh test-optimized test.txt
+
+1. Apply → apply_recommendations.py (PART 4 from analysis)
+2. Build → cmake --build IREE
+3. Benchmark → Run with optimized configuration
+4. Update → analyze_results.py --optimized-csv (add PART 6)
+5. Restore → Copy original C++ back
+```
+
+### Detailed Full Mode Flow
+
 ```
 User runs: ./run_parameter_search.sh full test.txt
 
@@ -16,11 +66,13 @@ User runs: ./run_parameter_search.sh full test.txt
 
 2. SWEEP (Process Isolation)
    [Process 1] optimize_single_limit.py --limit 1
-     1. Modify C++ → Set limitParallelLoops = 1
-     2. Comment out early returns
-     3. Rebuild IREE → Fresh iree-compile binary
-     4. Run benchmark → Test with modified compiler
-     5. Save CSV → limit_1_*.csv
+     1. Check if limit_1_*.csv exists (smart caching)
+     2. If not: Modify C++ → Set limitParallelLoops = 1
+     3. Comment out early returns
+     4. Rebuild IREE → Fresh iree-compile binary
+     5. Run benchmark → Test with modified compiler
+     6. Save CSV → limit_1_*.csv
+     7. Restore original C++
      [Exit - clean Python state]
    
    [Process 2] optimize_single_limit.py --limit 8
@@ -35,18 +87,21 @@ User runs: ./run_parameter_search.sh full test.txt
 
 4. INITIAL ANALYSIS
    analyze_results.py (first pass)
-   → Generate C++ recommendations
+   → Generate C++ recommendations (PART 4)
    → comprehensive_analysis.txt (Parts 1-5)
 
-5. VALIDATION (NEW!)
-   → Test optimized configuration
-   → Compare against baseline
-   → Save: optimized_config_*.csv
+5. VALIDATION (Integrated Function)
+   test_optimized_config() [bash function in main script]
+     1. apply_recommendations.py → Modify C++ with PART 4 code
+     2. cmake --build → Rebuild IREE
+     3. Benchmark → Run with optimized config
+     4. Save: optimized_config_*.csv
+     5. Restore original C++
 
 6. FINAL ANALYSIS
    analyze_results.py --optimized-csv (second pass)
    → Add Part 6: Validated performance
-   → comprehensive_analysis.txt (complete with validation)
+   → comprehensive_analysis.txt (complete with 6 parts)
 ```
 
 ## Core Components

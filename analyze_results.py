@@ -144,11 +144,18 @@ class ComprehensiveAnalyzer:
         sorted_runtimes = sorted(runtimes)
         n = len(sorted_runtimes)
         
-        # Geometric mean
-        product = 1.0
-        for r in runtimes:
-            product *= r
-        geo_mean = product ** (1.0 / n)
+        # Geometric mean (using log space to avoid overflow)
+        import math
+        try:
+            # Filter out zero or negative runtimes
+            valid_runtimes = [r for r in runtimes if r > 0]
+            if not valid_runtimes:
+                geo_mean = float('inf')
+            else:
+                log_sum = sum(math.log(r) for r in valid_runtimes)
+                geo_mean = math.exp(log_sum / len(valid_runtimes))
+        except (ValueError, OverflowError):
+            geo_mean = float('inf')
         
         # Percentiles
         p95_idx = int(0.95 * n)
@@ -1020,11 +1027,14 @@ class ComprehensiveAnalyzer:
                 lines.append(f"  Total Runtime:    {metrics['total_runtime']:.0f} ms")
                 lines.append("")
         
-        # Ranking by geometric mean
+        # Ranking by geometric mean (exclude baseline from ranking - it's the reference, not a candidate)
         if limit_stats:
-            ranked_limits = sorted(limit_stats.items(), key=lambda x: x[1]['geometric_mean'])
+            # Filter out baseline and non-integer limits for ranking
+            candidate_limits_only = [(l, m) for l, m in limit_stats.items() 
+                                     if isinstance(l, int) and l != baseline_limit]
+            ranked_limits = sorted(candidate_limits_only, key=lambda x: x[1]['geometric_mean'])
             
-            lines.append("Ranking by Geometric Mean:")
+            lines.append("Ranking by Geometric Mean (excluding baseline):")
             for rank, (limit, metrics) in enumerate(ranked_limits, 1):
                 best_marker = " ⭐ BEST OVERALL" if rank == 1 else ""
                 lines.append(f"  #{rank}: limit={limit} (GeoMean: {metrics['geometric_mean']:.2f}ms){best_marker}")
@@ -1219,30 +1229,6 @@ class ComprehensiveAnalyzer:
             lines.append(f"     Best limit: {char.best_limit}, Runtime: {char.best_runtime:.2f}ms, Speedup: {char.speedup:.2f}x")
             lines.append(f"     OutputSize: {char.output_size:,}, KSize: {char.k_size:,}")
             lines.append("")
-        
-        # Summary
-        lines.append("="*100)
-        lines.append("SUMMARY")
-        lines.append("="*100)
-        lines.append("")
-        
-        if ranked_limits:
-            best_limit, best_metrics = ranked_limits[0]
-            lines.append(f"Overall Best Configuration: limitParallelLoops = {best_limit}")
-            lines.append(f"  Geometric Mean: {best_metrics['geometric_mean']:.2f} ms")
-            lines.append(f"  Total Runtime:  {best_metrics['total_runtime']:.0f} ms")
-            
-            if baseline_limit and baseline_limit in limit_stats:
-                baseline_geo = limit_stats[baseline_limit]['geometric_mean']
-                improvement = (1 - best_metrics['geometric_mean'] / baseline_geo) * 100
-                lines.append(f"  Improvement over baseline (limit={baseline_limit}): {improvement:+.2f}%")
-        
-        lines.append("")
-        lines.append("For applying changes:")
-        lines.append("  1. Copy the C++ code from PART 4 above")
-        lines.append("  2. Replace the limitParallelLoops logic in SetSplitReductionSizes.cpp")
-        lines.append("  3. Rebuild IREE: cmake --build ../iree-build --target iree-compile")
-        lines.append("")
         
         # PART 6: Optimized Configuration Performance (if provided)
         if optimized_results:
