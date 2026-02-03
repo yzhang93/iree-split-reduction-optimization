@@ -86,13 +86,15 @@ with open(ratio_code_file, 'r') as f:
 with open(cpp_file, 'r') as f:
     lines = f.readlines()
 
-# Find the getWeightBackwardReductionSizes function and replace its logic
+# Process line by line to find and replace the logic
 output = []
 in_function = False
 function_brace_depth = 0
 skip_old_logic = False
+inserted = False
+found_getsizeat = False
 
-for line in lines:
+for i, line in enumerate(lines):
     # Detect function start
     if 'getWeightBackwardReductionSizes' in line and '(' in line:
         in_function = True
@@ -100,17 +102,24 @@ for line in lines:
         output.append(line)
         continue
     
-    # Track braces
+    # Track braces within the function
     if in_function:
         function_brace_depth += line.count('{') - line.count('}')
         
-        # Insert ratio-based code after maybeSizes extraction
-        if '*maybeSizes = ' in line and 'getSplitReductionSizes' in line:
+        # Track when we see the getSizeAt lambda closing
+        if 'auto getSizeAt = [' in line:
+            found_getsizeat = True
+        
+        # Look for the marker: right after depthSize calculation
+        # The ratio-based code needs imageSize and depthSize, so we keep those
+        if not inserted and found_getsizeat and 'depthSize = getSizeAt(outputShape, depthPos)' in line:
             output.append(line)
-            # Skip the next lines until we see "int64_t outputSize"
+            # Now skip all the old logic (constants, checks, old ratio code)
+            # and insert our new ratio-based code
             skip_old_logic = True
+            inserted = True
             
-            # Insert our ratio-based code
+            # Insert our ratio-based code with proper indentation
             output.append('\n')
             output.append('  // ========== RATIO-BASED SPLIT REDUCTION ==========\n')
             for code_line in ratio_code.split('\n'):
@@ -118,19 +127,30 @@ for line in lines:
                     output.append('  ' + code_line + '\n')
                 else:
                     output.append('\n')
-            
-            # Exit function after our code
+            output.append('\n')
             continue
         
+        # If we're skipping old logic, look for the "Based on the limitParallelLoops" comment
+        # which marks where our inserted code should end and the rest of the function continues
         if skip_old_logic:
-            # Skip old logic until we exit the function
-            if function_brace_depth <= 0:
-                in_function = False
+            if '// Based on the limitParallelLoops' in line:
+                # Found the continuation point - stop skipping
                 skip_old_logic = False
-                output.append(line)  # Closing brace
-            continue
+                output.append(line)
+                continue
+            else:
+                # Skip this line (it's part of the old logic we're replacing)
+                continue
+        
+        # Check if we've exited the function
+        if function_brace_depth <= 0:
+            in_function = False
     
     output.append(line)
+
+if not inserted:
+    print("❌ Error: Could not find insertion point (depthSize calculation)")
+    sys.exit(1)
 
 # Write modified file
 with open(cpp_file, 'w') as f:
@@ -313,11 +333,60 @@ if regressions:
 
 EOFCOMPARE
 
-# Step 7: Restore original C++ file
+# Step 7: Automatic restore & cleanup
 echo ""
-echo "Step 7: Restoring original C++ file..."
-cp "${CPP_FILE}.backup_before_ratio" "$CPP_FILE"
-echo "✓ Original C++ file restored"
+echo "Step 7: Restoring original code and cleaning up..."
+echo ""
+
+echo "1. Restoring original C++ code..."
+if [ -f "${CPP_FILE}.backup_before_ratio" ]; then
+    cp "${CPP_FILE}.backup_before_ratio" "$CPP_FILE"
+    echo "   ✓ Original code restored"
+else
+    echo "   ❌ Error: Backup file not found"
+    exit 1
+fi
+
+echo ""
+echo "2. Verifying restoration..."
+if grep -q "int64_t outputSize = outputChannelSize \* batchSize \* imageSize \* depthSize;" "$CPP_FILE"; then
+    echo "   ✓ Original outputSize-based code confirmed"
+else
+    echo "   ⚠️  Warning: Could not verify original code pattern"
+fi
+
+echo ""
+echo "3. Deleting backup files..."
+BACKUP_DIR="$(dirname "$CPP_FILE")"
+BACKUP_COUNT=$(ls -1 "$BACKUP_DIR"/SetSplitReductionSizes.cpp.backup* 2>/dev/null | wc -l)
+
+if [ "$BACKUP_COUNT" -gt 0 ]; then
+    echo "   Found $BACKUP_COUNT backup file(s)"
+    rm -f "$BACKUP_DIR"/SetSplitReductionSizes.cpp.backup*
+    echo "   ✓ All backup files deleted"
+else
+    echo "   No backup files to delete"
+fi
+
+echo ""
+echo "4. Rebuilding compiler with original code..."
+cd "$IREE_BUILD_DIR"
+if cmake --build . --target iree-compile -j$(nproc) 2>&1 | grep -E "(Building|error|\[.*%\])" | tail -10; then
+    echo ""
+    echo "   ✓ Rebuild successful"
+else
+    echo ""
+    echo "   ❌ Rebuild failed!"
+fi
+
+echo ""
+echo "═══════════════════════════════════════════════════════════════════════════════"
+echo "  ✅ CLEANUP COMPLETE"
+echo "═══════════════════════════════════════════════════════════════════════════════"
+echo ""
+echo "  ✓ Original C++ code:  RESTORED"
+echo "  ✓ Backup files:       DELETED"
+echo "  ✓ Compiler:           REBUILT"
 echo ""
 
 echo ""
@@ -329,10 +398,4 @@ echo "Results saved to:"
 echo "  - Generated code:     $RESULTS_DIR/ratio_based_code.cpp"
 echo "  - Benchmark results:  $RESULTS_DIR/ratio_based_${test_basename}.csv"
 echo "  - Analysis report:    $RESULTS_DIR/ratio_based_analysis.txt"
-echo ""
-echo "To apply this approach permanently:"
-echo "  1. Review the generated code in ratio_based_code.cpp"
-echo "  2. Manually integrate it into SetSplitReductionSizes.cpp"
-echo "  3. Remove the old early return logic (lines 230-252)"
-echo "  4. Rebuild IREE"
 echo ""

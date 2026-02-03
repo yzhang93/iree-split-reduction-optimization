@@ -172,10 +172,6 @@ FIRST_TEST_FILE="${TEST_FILES_ABS[0]}"
 TEST_BASENAME=$(basename "$FIRST_TEST_FILE")
 # Remove extension (.txt, .csv, etc.)
 TEST_NAME="${TEST_BASENAME%.*}"
-# Remove operation-specific suffixes (_conv, _matmul, _mixed)
-TEST_NAME="${TEST_NAME%_conv}"
-TEST_NAME="${TEST_NAME%_matmul}"
-TEST_NAME="${TEST_NAME%_mixed}"
 # Create results directory name
 RESULTS_DIR="../${TEST_NAME}_results"
 
