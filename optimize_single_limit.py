@@ -290,7 +290,7 @@ if [ -f .env ]; then
 fi
 
 # Run the benchmark
-python iree/turbine/kernel/boo/driver/driver.py \\
+python3 iree/turbine/kernel/boo/driver/driver.py \\
     --commands-file="$TEST_FILE" \\
     --csv="$CSV_FILE"
 """
@@ -312,26 +312,48 @@ python iree/turbine/kernel/boo/driver/driver.py \\
             # Clean up script
             script_path.unlink()
             
-            if result.returncode == 0 and csv_file.exists():
-                print(f"  ✓ Benchmark complete")
-                return csv_file
-            else:
-                print(f"  ✗ Benchmark failed: {result.stderr}")
-                return None
+            # Check if CSV file was created and has valid data
+            # Note: ROCTracer warnings may cause non-zero exit codes, but benchmarks still succeed
+            if csv_file.exists():
+                try:
+                    # Verify CSV has header + at least one data line
+                    lines = csv_file.read_text().strip().split('\n')
+                    if len(lines) >= 2:  # header + at least 1 result
+                        print(f"  ✓ Benchmark complete ({len(lines)-1} tests)")
+                        if result.returncode != 0:
+                            print(f"  ⚠️  Warning: Non-zero exit code ({result.returncode}), but CSV is valid")
+                        return csv_file
+                except Exception as e:
+                    print(f"  ✗ CSV file exists but is invalid: {e}")
+                    return None
+            
+            print(f"  ✗ Benchmark failed: {result.stderr[:200]}")
+            return None
         except subprocess.TimeoutExpired:
             print("Benchmark timed out")
             return None
     
     def parse_csv_results(self, csv_file: Path) -> List[Dict]:
-        """Parse CSV results"""
+        """Parse CSV results, skipping N.A. entries"""
         results = []
+        skipped = 0
         with open(csv_file, 'r') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                results.append({
-                    'arguments': row['arguments'],
-                    'mean': float(row['iree_boo_experimental mean'])
-                })
+                mean_val = row['iree_boo_experimental mean']
+                if mean_val == 'N.A.' or mean_val == '':
+                    skipped += 1
+                    continue
+                try:
+                    results.append({
+                        'arguments': row['arguments'],
+                        'mean': float(mean_val)
+                    })
+                except ValueError:
+                    skipped += 1
+                    continue
+        if skipped > 0:
+            print(f"  ℹ Skipped {skipped} tests with N.A. results")
         return results
 
 def main():

@@ -54,12 +54,68 @@ class ComprehensiveAnalyzer:
         
         self.analyses = self.data['analyses']
         self.candidate_limits = self.data['candidate_limits']
+        
+        # Load GEMM dimensions if available (from parser)
+        self.gemm_dimensions = {}
+        results_dir = results_file.parent
+        
+        # Try multiple possible dimension file locations
+        dimension_files_to_try = [
+            results_dir / (results_dir.name.replace('_results', '') + '_dimensions.json'),  # gemm_shapes_dimensions.json
+            results_dir / 'gemm_shapes_dimensions.json',  # Direct name
+        ]
+        
+        # Also look for any *_dimensions.json files in the results directory
+        for dim_file in results_dir.glob('*_dimensions.json'):
+            if dim_file not in dimension_files_to_try:
+                dimension_files_to_try.append(dim_file)
+        
+        for dimensions_file in dimension_files_to_try:
+            if dimensions_file.exists():
+                try:
+                    with open(dimensions_file, 'r') as f:
+                        gemm_data = json.load(f)
+                        # Build a mapping from test line to dimensions
+                        for entry in gemm_data:
+                            if 'line' in entry:
+                                # Use first 80 chars of line as key
+                                key = entry['line']
+                                self.gemm_dimensions[key] = entry
+                    if self.gemm_dimensions:
+                        print(f"✓ Loaded {len(self.gemm_dimensions)} GEMM dimension entries from {dimensions_file.name}")
+                        break
+                except Exception as e:
+                    print(f"Warning: Could not load dimensions from {dimensions_file}: {e}")
+        
+        # Load captured dimensions from baseline logging (if available)
+        self.captured_dimensions = []
+        captured_file = results_dir / 'captured_dimensions.json'
+        if captured_file.exists():
+            try:
+                with open(captured_file, 'r') as f:
+                    self.captured_dimensions = json.load(f)
+                if self.captured_dimensions:
+                    print(f"✓ Loaded {len(self.captured_dimensions)} captured dimension entries from logs")
+            except Exception as e:
+                print(f"Warning: Could not load captured dimensions: {e}")
     
     def extract_characteristics(self) -> List[TestCharacteristics]:
         """Extract problem characteristics from all test cases"""
         characteristics = []
         
-        for test_name, analysis in self.analyses.items():
+        # Build lookups for captured dimensions:
+        # 1. By test_config (preferred - exact match)
+        # 2. By index (fallback for backwards compatibility)
+        captured_by_config = {}
+        captured_by_index = {}
+        for idx, cap_dim in enumerate(self.captured_dimensions):
+            captured_by_index[idx] = cap_dim
+            # Use test_config if available (new format)
+            test_config = cap_dim.get('test_config')
+            if test_config:
+                captured_by_config[test_config] = cap_dim
+        
+        for test_idx, (test_name, analysis) in enumerate(self.analyses.items()):
             csv_data = analysis['csv_data']
             
             # Parse dimensions from arguments string
@@ -70,9 +126,77 @@ class ComprehensiveAnalyzer:
             n = dims['n']
             k = dims['k']
             
+            # If parsing failed (m, n, k all 0), try captured dimensions
+            # First try matching by test_config (exact match), then fall back to index
+            cap_dim = None
+            if m == 0 and n == 0 and k == 0:
+                if test_name in captured_by_config:
+                    cap_dim = captured_by_config[test_name]
+                elif test_idx in captured_by_index:
+                    cap_dim = captured_by_index[test_idx]
+            
+            if cap_dim:
+                if cap_dim.get('type') == 'matmul':
+                    m = cap_dim.get('mSize', 0)
+                    n = cap_dim.get('nSize', 0)
+                    k = cap_dim.get('kSize', 0)
+                elif cap_dim.get('type') == 'conv':
+                    # For conv, use outputSize and reductionSize directly
+                    output_size = cap_dim.get('outputSize', 0)
+                    k_size = cap_dim.get('reductionSize', 0)
+                    ratio = k_size / (output_size ** 0.5) if output_size > 0 else 0.0
+                    
+                    # Convert all_runtimes keys from strings to ints (except "baseline")
+                    all_runtimes = analysis.get('all_runtimes', {})
+                    if all_runtimes:
+                        converted = {}
+                        for rk, rv in all_runtimes.items():
+                            if rk == "baseline" or (isinstance(rk, str) and rk.lower() == "baseline"):
+                                converted["baseline"] = float(rv)
+                            else:
+                                converted[int(rk)] = float(rv)
+                        all_runtimes = converted
+                    
+                    characteristics.append(TestCharacteristics(
+                        test_name=test_name,
+                        best_limit=analysis['best_limit'],
+                        best_runtime=analysis['best_runtime'],
+                        speedup=analysis['speedup_vs_worst'],
+                        output_size=output_size,
+                        k_size=k_size,
+                        ratio=ratio,
+                        m=int(output_size ** 0.5) if output_size > 0 else 0,
+                        n=int(output_size ** 0.5) if output_size > 0 else 0,
+                        k=k_size,
+                        all_runtimes=all_runtimes
+                    ))
+                    continue
+            
             # Calculate characteristics
             output_size = m * n if (m and n) else 0
             k_size = k if k else 0
+            
+            # If we still have 0s and have captured dimensions for this test, use them
+            # First try matching by test_config (exact match), then fall back to index
+            cap_dim_fallback = None
+            if output_size == 0 or k_size == 0:
+                if test_name in captured_by_config:
+                    cap_dim_fallback = captured_by_config[test_name]
+                elif test_idx in captured_by_index:
+                    cap_dim_fallback = captured_by_index[test_idx]
+            
+            if cap_dim_fallback and cap_dim_fallback.get('type') == 'matmul':
+                if output_size == 0:
+                    output_size = cap_dim_fallback.get('outputSize', 0)
+                if k_size == 0:
+                    k_size = cap_dim_fallback.get('kSize', 0)
+                if m == 0:
+                    m = cap_dim_fallback.get('mSize', 0)
+                if n == 0:
+                    n = cap_dim_fallback.get('nSize', 0)
+                if k == 0:
+                    k = cap_dim_fallback.get('kSize', 0)
+            
             ratio = k_size / output_size if output_size > 0 else 0.0
             
             # Convert all_runtimes keys from strings to ints (except "baseline")
@@ -105,6 +229,34 @@ class ComprehensiveAnalyzer:
     
     def _parse_arguments(self, args_string: str) -> Dict[str, int]:
         """Parse dimensions from convolution/matmul arguments string"""
+        
+        # First, check if this is a GEMM test (aten::mm or aten::addmm)
+        if ('aten::mm' in args_string or 'aten::addmm' in args_string) and self.gemm_dimensions:
+            # Extract the dimension arrays from the args_string
+            # Pattern: [[...]] with possible quotes around it
+            match = re.search(r"'?\[\[.*?\]\]'?", args_string)
+            if match:
+                dims_part = match.group(0)  # e.g., "'[[3840, 11520], [11520, 3840]]'"
+                
+                # Try to find a matching dimension entry
+                for key, dims in self.gemm_dimensions.items():
+                    # Extract dimensions from the key in the same way
+                    key_match = re.search(r'"?\[\[.*?\]\]"?', key)
+                    if key_match:
+                        key_dims_part = key_match.group(0)
+                        # Compare the dimension arrays (normalize quotes and spaces)
+                        # Remove all quotes and spaces for comparison
+                        normalized_args = dims_part.replace("'", "").replace('"', '').replace(' ', '')
+                        normalized_key = key_dims_part.replace("'", "").replace('"', '').replace(' ', '')
+                        
+                        if normalized_args == normalized_key:
+                            return {
+                                'm': dims['M'],
+                                'n': dims['N'],
+                                'k': dims['K']
+                            }
+        
+        # Fall back to convolution format parsing
         def extract_value(flag: str) -> int:
             pattern = rf'{flag}\s+(\d+)'
             match = re.search(pattern, args_string)
@@ -674,12 +826,14 @@ class ComprehensiveAnalyzer:
     
     def detect_operation_type(self, test_name: str) -> str:
         """Detect if test is convolution or matmul based on test name"""
-        # Weight backward convolutions typically have filter dimensions
+        # ATen GEMM operations
+        if test_name.startswith('aten::mm') or test_name.startswith('aten::addmm') or test_name.startswith('aten::bmm'):
+            return 'matmul'
         # Matmuls typically have -y 1 -x 1 (no spatial convolution)
         if '-y 1 -x 1' in test_name or 'matmul' in test_name.lower():
             return 'matmul'
-        else:
-            return 'conv'
+        # Weight backward convolutions typically have filter dimensions
+        return 'conv'
     
     def analyze_early_return_candidates(self, characteristics: List[TestCharacteristics]) -> Dict:
         """Analyze cases where limit=1 (no split) performs best.
@@ -894,10 +1048,10 @@ class ComprehensiveAnalyzer:
             m_n_str = self._format_as_product(threshold)
             
             if first:
-                code_lines.append(f"  if (outputSize < {m_n_str}) {{  // {count} tests, avg speedup: {speedup:.2f}x")
+                code_lines.append(f"  if (outputSize <= {m_n_str}) {{  // {count} tests, avg speedup: {speedup:.2f}x")
                 first = False
             else:
-                code_lines.append(f"  }} else if (outputSize < {m_n_str}) {{  // {count} tests, avg speedup: {speedup:.2f}x")
+                code_lines.append(f"  }} else if (outputSize <= {m_n_str}) {{  // {count} tests, avg speedup: {speedup:.2f}x")
             
             code_lines.append(f"    limitParallelLoops = {limit};")
         
@@ -912,12 +1066,18 @@ class ComprehensiveAnalyzer:
                 else_speedup = thresh['avg_speedup']
                 break
         
-        # Always use 16 for else clause to align with original code
-        # This provides a sensible default fallback regardless of the data
-        else_limit = 16
+        # Use the data-driven else_limit, or default to 16 if not found
+        # NOTE: limit=1 effectively disables split reduction (returns std::nullopt)
+        # So we use a minimum of 8 for the else clause to ensure split reduction happens
+        if else_limit is None or else_limit < 8:
+            else_limit = 8  # Minimum viable limit for else clause
         
         code_lines.append(f"  }} else {{  // {else_count} tests, avg speedup: {else_speedup:.2f}x")
-        code_lines.append(f"    limitParallelLoops = std::min<int64_t>({else_limit}, tileSizes[0]);")
+        # Use the actual limit from data, with tileSizes[0] constraint only for small limits
+        if else_limit <= 16:
+            code_lines.append(f"    limitParallelLoops = std::min<int64_t>({else_limit}, tileSizes[0]);")
+        else:
+            code_lines.append(f"    limitParallelLoops = {else_limit};")
         code_lines.append(f"  }}")
         
         return "\n".join(code_lines)
@@ -1356,6 +1516,161 @@ class ComprehensiveAnalyzer:
             f.write(report_text)
         
         print(f"✓ Comprehensive analysis saved to: {output_file}")
+        
+        # Generate detailed limit breakdown file
+        self.generate_limit_details_report(characteristics, clusters, baseline_limit, output_file.parent)
+    
+    def generate_limit_details_report(self, characteristics: List[TestCharacteristics], 
+                                       clusters: Dict[Union[int, str], List[TestCharacteristics]],
+                                       baseline_limit: Union[int, str],
+                                       output_dir: Path):
+        """Generate detailed breakdown of which configs improved for each limit"""
+        
+        details_file = output_dir / 'limit_details_breakdown.txt'
+        
+        lines = []
+        lines.append("="*100)
+        lines.append("DETAILED BREAKDOWN: CONFIGURATIONS BY OPTIMAL LIMIT")
+        lines.append("="*100)
+        lines.append("")
+        lines.append("This file shows, for each optimal limitParallelLoops value:")
+        lines.append("  - All test configurations that perform best with this limit")
+        lines.append("  - Baseline runtime vs optimized runtime")
+        lines.append("  - Speedup achieved")
+        lines.append("")
+        lines.append(f"Baseline for comparison: limit={baseline_limit}")
+        lines.append("")
+        
+        # Group by ACTUAL best limit (not clustered assignment)
+        # This ensures the breakdown matches the sweep results
+        actual_best_by_limit = defaultdict(list)
+        for char in characteristics:
+            if isinstance(char.best_limit, int):
+                actual_best_by_limit[char.best_limit].append(char)
+        
+        # Sort limits from largest to smallest for better readability
+        sorted_limits = sorted([l for l in actual_best_by_limit.keys() if isinstance(l, int)], reverse=True)
+        
+        for limit in sorted_limits:
+            tests_for_limit = actual_best_by_limit[limit]
+            
+            lines.append("="*100)
+            lines.append(f"OPTIMAL LIMIT = {limit}")
+            lines.append(f"Total tests: {len(tests_for_limit)}")
+            lines.append("="*100)
+            lines.append("")
+            
+            # Header for the table
+            lines.append(f"{'#':<4} {'Test Config':<50} {'Baseline(ms)':>12} {'Optimized(ms)':>13} {'Speedup':>10} {'Ratio':>12}")
+            lines.append("-"*110)
+            
+            # Collect and sort by speedup
+            test_details = []
+            for char in tests_for_limit:
+                baseline_runtime = None
+                optimized_runtime = char.best_runtime
+                
+                if char.all_runtimes:
+                    # Get baseline runtime
+                    if baseline_limit in char.all_runtimes:
+                        baseline_runtime = char.all_runtimes[baseline_limit]
+                    elif 'baseline' in char.all_runtimes:
+                        baseline_runtime = char.all_runtimes['baseline']
+                
+                if baseline_runtime and baseline_runtime > 0:
+                    speedup = baseline_runtime / optimized_runtime
+                else:
+                    speedup = 0
+                    baseline_runtime = None
+                
+                # Calculate ratio: kSize / sqrt(outputSize)
+                if char.output_size > 0:
+                    ratio = char.k_size / (char.output_size ** 0.5)
+                else:
+                    ratio = 0
+                
+                test_details.append({
+                    'name': char.test_name,
+                    'baseline': baseline_runtime,
+                    'optimized': optimized_runtime,
+                    'speedup': speedup,
+                    'output_size': char.output_size,
+                    'k_size': char.k_size,
+                    'ratio': ratio
+                })
+            
+            # Sort by speedup (highest first)
+            test_details.sort(key=lambda x: x['speedup'], reverse=True)
+            
+            # Print details
+            for i, detail in enumerate(test_details, 1):
+                test_name = detail['name'][:48] + '..' if len(detail['name']) > 50 else detail['name']
+                baseline_str = f"{detail['baseline']:.2f}" if detail['baseline'] else "N/A"
+                optimized_str = f"{detail['optimized']:.2f}"
+                speedup_str = f"{detail['speedup']:.2f}x" if detail['speedup'] > 0 else "N/A"
+                ratio_str = f"{detail['ratio']:.2f}" if detail['ratio'] > 0 else "N/A"
+                
+                lines.append(f"{i:<4} {test_name:<50} {baseline_str:>12} {optimized_str:>13} {speedup_str:>10} {ratio_str:>12}")
+            
+            lines.append("")
+            
+            # Summary statistics for this limit
+            valid_speedups = [d['speedup'] for d in test_details if d['speedup'] > 0]
+            if valid_speedups:
+                avg_speedup = sum(valid_speedups) / len(valid_speedups)
+                max_speedup = max(valid_speedups)
+                min_speedup = min(valid_speedups)
+                
+                lines.append(f"Statistics for limit={limit}:")
+                lines.append(f"  Average Speedup: {avg_speedup:.2f}x")
+                lines.append(f"  Max Speedup:     {max_speedup:.2f}x")
+                lines.append(f"  Min Speedup:     {min_speedup:.2f}x")
+            
+            lines.append("")
+            lines.append("")
+        
+        # Also generate a CSV version for easy importing into spreadsheets
+        csv_file = output_dir / 'limit_details_breakdown.csv'
+        csv_lines = ['optimal_limit,test_config,baseline_ms,optimized_ms,speedup,output_size,k_size,ratio']
+        
+        for limit in sorted_limits:
+            tests_for_limit = actual_best_by_limit[limit]
+            for char in tests_for_limit:
+                baseline_runtime = None
+                optimized_runtime = char.best_runtime
+                
+                if char.all_runtimes:
+                    if baseline_limit in char.all_runtimes:
+                        baseline_runtime = char.all_runtimes[baseline_limit]
+                    elif 'baseline' in char.all_runtimes:
+                        baseline_runtime = char.all_runtimes['baseline']
+                
+                if baseline_runtime and baseline_runtime > 0:
+                    speedup = baseline_runtime / optimized_runtime
+                else:
+                    speedup = 0
+                    baseline_runtime = 0
+                
+                # Calculate ratio: kSize / sqrt(outputSize)
+                if char.output_size > 0:
+                    ratio = char.k_size / (char.output_size ** 0.5)
+                else:
+                    ratio = 0
+                
+                # Escape commas in test name for CSV
+                escaped_name = char.test_name.replace('"', '""')
+                csv_lines.append(f'{limit},"{escaped_name}",{baseline_runtime:.2f},{optimized_runtime:.2f},{speedup:.2f},{char.output_size},{char.k_size},{ratio:.2f}')
+        
+        # Write text file
+        with open(details_file, 'w') as f:
+            f.write("\n".join(lines))
+        
+        # Write CSV file
+        with open(csv_file, 'w') as f:
+            f.write("\n".join(csv_lines))
+        
+        print(f"✓ Detailed limit breakdown saved to: {details_file}")
+        print(f"✓ CSV version saved to: {csv_file}")
 
 
 def parse_baseline_limit(value):

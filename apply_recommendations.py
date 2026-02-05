@@ -37,13 +37,17 @@ def extract_recommendations(analysis_file: Path) -> Dict:
     
     if part4b_idx != -1:
         # Find the start of the if-else logic
+        # Try both < and <= patterns
         logic_start = content.find("if (outputSize <", part4b_idx)
+        if logic_start == -1:
+            logic_start = content.find("if (outputSize <=", part4b_idx)
         if logic_start != -1:
             # Find the matching closing brace for the entire if-else chain
-            # Count braces to find the end
+            # Need to handle: if {...} else if {...} else {...}
             brace_count = 0
             i = logic_start
             start_found = False
+            logic_end = None
             while i < len(content):
                 if content[i] == '{':
                     brace_count += 1
@@ -51,12 +55,24 @@ def extract_recommendations(analysis_file: Path) -> Dict:
                 elif content[i] == '}':
                     brace_count -= 1
                     if start_found and brace_count == 0:
-                        # This is the end of the if-else chain
+                        # Found a closing brace, but check if there's an else/else if following
                         logic_end = i + 1
-                        recommendations['limit_logic'] = content[logic_start:logic_end].strip()
-                        print(f"✓ Extracted limitParallelLoops logic ({len(recommendations['limit_logic'])} chars)")
-                        break
+                        # Skip whitespace and look for 'else'
+                        j = i + 1
+                        while j < len(content) and content[j] in ' \t\n':
+                            j += 1
+                        if j < len(content) - 4 and content[j:j+4] == 'else':
+                            # There's an else, continue to capture it
+                            i = j
+                            continue
+                        else:
+                            # No more else, we're done
+                            break
                 i += 1
+            
+            if logic_end:
+                recommendations['limit_logic'] = content[logic_start:logic_end].strip()
+                print(f"✓ Extracted limitParallelLoops logic ({len(recommendations['limit_logic'])} chars)")
     
     return recommendations
 
@@ -93,7 +109,7 @@ def apply_to_cpp(cpp_file: Path, recommendations: Dict) -> bool:
     if recommendations['limit_logic']:
         # Find the function with limitParallelLoops logic
         # Look for pattern: int64_t limitParallelLoops; followed by if-else
-        pattern = r'(int64_t limitParallelLoops;\s*(?://[^\n]*)?\s*(?:/\*.*?\*/)?\s*)(if\s*\((?:outputSize|kSize)[^}]+\}(?:\s*else\s+if[^}]+\})*\s*else\s*\{[^}]+\})'
+        pattern = r'(int64_t limitParallelLoops;\s*(?://[^\n]*)?\s*(?:/\*.*?\*/)?\s*)(if\s*\((?:outputSize|kSize)\s*[<>=]+[^}]+\}(?:\s*else\s+if[^}]+\})*\s*else\s*\{[^}]+\})'
         
         def replace_logic(match):
             nonlocal modified
