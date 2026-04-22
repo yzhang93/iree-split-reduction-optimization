@@ -18,7 +18,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CPP_FILE="../iree/compiler/src/iree/compiler/DispatchCreation/SetSplitReductionSizes.cpp"
 IREE_BUILD_DIR="../iree-build"
 TURBINE_DIR="../iree-turbine"
-GPU_ID=7
+# This machine has a single AMD GPU (ROCm), so device index is 0.
+# Use HIP_VISIBLE_DEVICES (not CUDA_VISIBLE_DEVICES) for ROCm/HIP builds of PyTorch.
+GPU_ID=0
 
 # Check if running in split_reduction_optimization directory
 if [[ ! -f "optimize_single_limit.py" ]]; then
@@ -99,6 +101,7 @@ set -e
 # Set up IREE environment
 export PATH="$IREE_BUILD_DIR/tools:\$PATH"
 export PYTHONPATH="$IREE_BUILD_DIR/compiler/bindings/python:\$PYTHONPATH"
+export HIP_VISIBLE_DEVICES=$GPU_ID
 export CUDA_VISIBLE_DEVICES=$GPU_ID
 
 # Activate turbine venv and load .env
@@ -197,7 +200,7 @@ case "$MODE" in
         echo "Quick mode: Testing 4 values (including no-split baseline)"
         ;;
     full)
-        LIMITS=(1 8 16 32 64 128 256 512 1024 2048)
+        LIMITS=(1 8 16 32 64 128 256 1024)
         echo "Full mode: Testing 10 values (including no-split baseline)"
         ;;
     analyze)
@@ -493,6 +496,7 @@ def run_single_test(test_config, csv_output, dimension_log, turbine_dir, iree_bu
         env = os.environ.copy()
         env['PATH'] = f"{iree_build_dir}/tools:" + env.get('PATH', '')
         env['PYTHONPATH'] = f"{iree_build_dir}/compiler/bindings/python:" + env.get('PYTHONPATH', '')
+        env['HIP_VISIBLE_DEVICES'] = str(gpu_id)
         env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
         
         # Run from turbine directory

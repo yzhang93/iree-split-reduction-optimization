@@ -25,7 +25,7 @@ class LimitParallelLoopsOptimizer:
         self.turbine_dir = Path(turbine_dir)
         self.results_dir = Path(results_dir)
         self.backup_file = self.cpp_file.with_suffix('.cpp.backup')
-        self.gpu_id = 5
+        self.gpu_id = 0
         
         # Create backup if doesn't exist
         if not self.backup_file.exists():
@@ -35,182 +35,177 @@ class LimitParallelLoopsOptimizer:
         self.results_dir.mkdir(parents=True, exist_ok=True)
     
     def set_fixed_limitParallelLoops(self, limit_value: int, mode: str = 'both'):
-        """Modify C++ file to use a fixed limitParallelLoops value
-        
-        This also comments out early return checks so we can test all limitParallelLoops
-        values without being skipped by the heuristics.
+        """Modify C++ file to use a fixed limitParallelLoops value.
+
+        Also wraps the two "heuristic" early-return `if` blocks in each of
+        `getConvolutionReductionSizes` and `getMatmulLikeReductionSizes` in
+        `#if 0 / #endif` so that no op is skipped by the stale heuristics
+        during the limitParallelLoops sweep. The other early returns (dynamic
+        shape checks, failed inference, etc.) are left intact.
+
+        Pattern matching is tied to the current shape of
+        SetSplitReductionSizes.cpp. If upstream changes the heuristic
+        conditions, update the substrings in HEURISTIC_EARLY_RETURNS and
+        CONSTANTS_END_MARKER below.
         """
+        # Heuristic early-return `if` statements we want to disable.
+        # Key: function tag ('conv' or 'matmul'); Value: list of unique
+        # substrings that identify the start of each heuristic-early-return.
+        HEURISTIC_EARLY_RETURNS = {
+            'conv': [
+                'if (parallelSize >= largeParallelSize',
+                'if (ratio <= ratioThreshold',  # compound w/ reductionSize
+            ],
+            'matmul': [
+                'if (outputSize > largeOutputSize',
+                'if (kSize < largeKSize',       # compound w/ ratio
+            ],
+        }
+        # The LAST constant declaration in the heuristic-constants block of
+        # each function -- used as the anchor for (void) suppressions so the
+        # constants don't become "unused variable" build errors once the
+        # early returns are disabled.
+        CONSTANTS_END_MARKER = {
+            'conv': 'const int64_t ratioThreshold = 64;',
+            'matmul': 'const int64_t ratioThreshold = 48;',
+        }
+        CONSTANTS_TO_SUPPRESS = {
+            'conv': ['largeParallelSize', 'largeReductionSize', 'ratioThreshold'],
+            'matmul': ['largeOutputSize', 'largeKSize', 'ratioThreshold'],
+        }
+        # Where the `ratio` (and any companion) variables get declared.
+        # After disabling the early returns these become unused.
+        RATIO_DECL_MARKER = {
+            'conv': 'int64_t ratio = reductionSize / std::sqrt(parallelSize);',
+            'matmul': 'int64_t ratio = kSize / std::sqrt(mSize * nSize) / batchSize;',
+        }
+        RATIO_COMPANION_SUPPRESS = {
+            'conv': ['reductionSize', 'ratio'],
+            'matmul': ['ratio'],
+        }
+        # Extra (void) casts for locals that become unused once the
+        # original `limitParallelLoops` if-else chain is `#if 0`'d out.
+        EXTRA_LIMIT_SUPPRESS = {
+            'conv': ['outputSize', 'startTileSize'],
+            'matmul': ['outputSize', 'kSize'],
+        }
+        # Which function tag corresponds to which --function mode.
+        MODE_ENABLES = {
+            'conv':   {'conv'},
+            'matmul': {'matmul'},
+            'both':   {'conv', 'matmul'},
+            'mixed':  {'conv', 'matmul'},
+        }
+        enabled = MODE_ENABLES.get(mode, {'conv', 'matmul'})
+
         with open(self.cpp_file, 'r') as f:
             lines = f.readlines()
-        
+
         modified_lines = []
-        in_wb_function = False
-        in_mm_function = False
+        current_func = None          # 'conv', 'matmul', or None
         function_brace_depth = 0
-        function_started = False  # True once we see the first { after function declaration
+        function_started = False     # True once we see the first { after function declaration
         skip_until_closing_brace = False
         skip_brace_depth = 0
-        in_early_return_block = False  # Track if we're in an early return if statement
-        constants_declared = {'wb': False, 'mm': False}  # Track if we've added suppression after constants
-        
+        in_early_return_block = False
+        constants_declared = {'conv': False, 'matmul': False}
+
         i = 0
         while i < len(lines):
             line = lines[i]
-            
-            # Track which function we're in based on line content
-            if 'getWeightBackwardReductionSizes' in line and '(' in line:
-                in_wb_function = True
-                in_mm_function = False
+
+            # Track which function we're in based on line content.
+            if 'getConvolutionReductionSizes' in line and '(' in line:
+                current_func = 'conv'
                 function_brace_depth = 0
                 function_started = False
             elif 'getMatmulLikeReductionSizes' in line and '(' in line:
-                in_mm_function = True
-                in_wb_function = False
+                current_func = 'matmul'
                 function_brace_depth = 0
                 function_started = False
-            
-            # Track braces to know when we exit the function
-            if (in_wb_function or in_mm_function) and not skip_until_closing_brace:
-                # Once we see a {, the function body has started
+
+            # Track braces to know when we exit the function.
+            if current_func is not None and not skip_until_closing_brace:
                 if '{' in line:
                     function_started = True
-                
                 if function_started:
                     function_brace_depth += line.count('{') - line.count('}')
                     if function_brace_depth <= 0:
-                        in_wb_function = False
-                        in_mm_function = False
+                        current_func = None
                         function_brace_depth = 0
                         function_started = False
-            
-            # Handle skipping original if-else logic
+
+            # Handle skipping original limitParallelLoops if-else chain.
             if skip_until_closing_brace:
-                # Track braces to find the end of the if-else block
                 skip_brace_depth += line.count('{') - line.count('}')
                 modified_lines.append(line)
-                
-                # When we're back to depth 0, we've exited the if-else block
                 if skip_brace_depth <= 0:
                     modified_lines.append('#endif  // OPTIMIZER\n')
                     skip_until_closing_brace = False
                     skip_brace_depth = 0
                 i += 1
                 continue
-            
-            # Comment out early return checks (so we can test all limitParallelLoops values)
-            # Detect start of early return blocks by looking for the if statement
-            # Weight backward: "if (outputChannelSize >= largeParallelSize"
-            if in_wb_function and function_started and 'if (outputChannelSize >= largeParallelSize' in line:
-                modified_lines.append('#if 0  // OPTIMIZER: Disabled early return to test all limits\n')
+
+            # Disable heuristic early returns inside enabled functions.
+            if (current_func in enabled
+                    and function_started
+                    and not in_early_return_block
+                    and any(pat in line for pat in HEURISTIC_EARLY_RETURNS[current_func])):
+                modified_lines.append(
+                    '#if 0  // OPTIMIZER: Disabled early return to test all limits\n')
                 in_early_return_block = True
-            
-            # Weight backward: "if (ratio <= ratioThreshold"
-            elif in_wb_function and function_started and 'if (ratio <= ratioThreshold' in line:
-                modified_lines.append('#if 0  // OPTIMIZER: Disabled early return to test all limits\n')
-                in_early_return_block = True
-            
-            # Matmul-like: "if (mSize > largeMNSize"
-            elif in_mm_function and function_started and 'if (mSize > largeMNSize' in line:
-                modified_lines.append('#if 0  // OPTIMIZER: Disabled early return to test all limits\n')
-                in_early_return_block = True
-            
-            # Matmul-like: "if (ratio <= ratioThreshold"
-            elif in_mm_function and function_started and 'if (ratio <= ratioThreshold' in line:
-                modified_lines.append('#if 0  // OPTIMIZER: Disabled early return to test all limits\n')
-                in_early_return_block = True
-            
-            # If in early return block, append lines and look for the closing brace
+
             if in_early_return_block:
                 modified_lines.append(line)
-                # Look for the closing brace of the if block (single '}' line or '  }')
                 if line.strip() == '}':
                     modified_lines.append('#endif  // OPTIMIZER\n')
                     in_early_return_block = False
                 i += 1
                 continue
-            
-            # Add unused variable suppressions after constant declarations
-            # Weight backward function constants
-            if in_wb_function and not constants_declared['wb'] and 'const int64_t ratioThreshold = 64;' in line:
+
+            # (void)-suppress the heuristic constants once we hit the last one
+            # so they don't trigger unused-variable warnings.
+            if (current_func in enabled
+                    and not constants_declared[current_func]
+                    and CONSTANTS_END_MARKER[current_func] in line):
                 modified_lines.append(line)
-                # Add blank line and suppressions
                 modified_lines.append('\n')
                 modified_lines.append('  // OPTIMIZER: Suppress unused variable warnings\n')
-                modified_lines.append('  (void)largeParallelSize;\n')
-                modified_lines.append('  (void)largeReductionSize;\n')
-                modified_lines.append('  (void)ratioThreshold;\n')
-                constants_declared['wb'] = True
+                for name in CONSTANTS_TO_SUPPRESS[current_func]:
+                    modified_lines.append(f'  (void){name};\n')
+                constants_declared[current_func] = True
                 i += 1
                 continue
-            
-            # Matmul-like function constants (add suppressions after the last one)
-            if in_mm_function and not constants_declared['mm'] and 'const int64_t largeMNSize = 1024;' in line:
+
+            # (void)-suppress ratio (and companions) once declared, since the
+            # heuristic early returns that used them are now disabled.
+            if current_func in enabled and RATIO_DECL_MARKER[current_func] in line:
                 modified_lines.append(line)
-                # Add blank line and suppressions
-                modified_lines.append('\n')
-                modified_lines.append('  // OPTIMIZER: Suppress unused variable warnings\n')
-                modified_lines.append('  (void)ratioThreshold;\n')
-                modified_lines.append('  (void)largeKSize;\n')
-                modified_lines.append('  (void)largeMNSize;\n')
-                constants_declared['mm'] = True
+                for name in RATIO_COMPANION_SUPPRESS[current_func]:
+                    modified_lines.append(
+                        f'  (void){name};  // OPTIMIZER: Suppress unused warning\n')
                 i += 1
                 continue
-            
-            # Suppress ratio variable in weight backward function (used only in early return)
-            if in_wb_function and 'int64_t ratio = reductionSize / std::sqrt(outputChannelSize * batchSize);' in line:
+
+            # Replace the `limitParallelLoops` if-else cascade with a fixed value.
+            if (current_func in enabled
+                    and function_started
+                    and 'int64_t limitParallelLoops;' in line):
                 modified_lines.append(line)
-                modified_lines.append('  (void)reductionSize;  // OPTIMIZER: Suppress unused warning\n')
-                modified_lines.append('  (void)ratio;  // OPTIMIZER: Suppress unused warning\n')
+                modified_lines.append('  // OPTIMIZER: Fixed value for testing\n')
+                modified_lines.append(f'  limitParallelLoops = {limit_value};\n')
+                for name in EXTRA_LIMIT_SUPPRESS[current_func]:
+                    modified_lines.append(
+                        f'  (void){name};  // Suppress unused warning\n')
+                modified_lines.append('#if 0  // Original code disabled\n')
+                skip_until_closing_brace = True
+                skip_brace_depth = 0
                 i += 1
                 continue
-            
-            # Suppress ratio variable in matmul-like function (used only in early return)
-            if in_mm_function and 'int64_t ratio = kSize / std::sqrt(mSize * nSize) / batchSize;' in line:
-                modified_lines.append(line)
-                modified_lines.append('  (void)ratio;  // OPTIMIZER: Suppress unused warning\n')
-                i += 1
-                continue
-            
-            # Modify weight backward function
-            if in_wb_function and function_started and 'int64_t limitParallelLoops;' in line:
-                if mode == 'conv' or mode == 'mixed' or mode == 'both':
-                    modified_lines.append(line)
-                    modified_lines.append(f'  // OPTIMIZER: Fixed value for testing\n')
-                    modified_lines.append(f'  limitParallelLoops = {limit_value};\n')
-                    modified_lines.append(f'  (void)outputSize;  // Suppress unused warning\n')
-                    modified_lines.append(f'#if 0  // Original code disabled\n')
-                    skip_until_closing_brace = True
-                    skip_brace_depth = 0
-                    i += 1
-                    continue
-                else:
-                    modified_lines.append(line)
-                    i += 1
-                    continue
-            
-            # Modify matmul-like function
-            if in_mm_function and function_started and 'int64_t limitParallelLoops;' in line:
-                if mode == 'matmul' or mode == 'mixed' or mode == 'both' or mode == 'conv':
-                    modified_lines.append(line)
-                    modified_lines.append(f'  // OPTIMIZER: Fixed value for testing\n')
-                    modified_lines.append(f'  limitParallelLoops = {limit_value};\n')
-                    modified_lines.append(f'  (void)outputSize;  // Suppress unused warning\n')
-                    modified_lines.append(f'  (void)kSize;       // Suppress unused warning\n')
-                    modified_lines.append(f'#if 0  // Original code disabled\n')
-                    skip_until_closing_brace = True
-                    skip_brace_depth = 0
-                    i += 1
-                    continue
-                else:
-                    modified_lines.append(line)
-                    i += 1
-                    continue
-            
-            # Regular line
+
             modified_lines.append(line)
             i += 1
-        
-        # Write modified file
+
         with open(self.cpp_file, 'w') as f:
             f.writelines(modified_lines)
     
@@ -277,6 +272,7 @@ export PATH="$IREE_BUILD_DIR/tools:$PATH"
 export PYTHONPATH="$IREE_BUILD_DIR/compiler/bindings/python:$PYTHONPATH"
 
 # Set GPU
+export HIP_VISIBLE_DEVICES={self.gpu_id}
 export CUDA_VISIBLE_DEVICES={self.gpu_id}
 
 # Activate turbine venv and setup Python environment
