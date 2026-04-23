@@ -485,21 +485,37 @@ total_baseline = sum(baseline[t] for t in common)
 total_ratio = sum(ratio[t] for t in common)
 speedup = total_baseline / total_ratio
 
-improved = sum(1 for t in common if ratio[t] < baseline[t] * 0.99)
-neutral = sum(1 for t in common if 0.99 <= ratio[t] / baseline[t] <= 1.01)
-regressed = sum(1 for t in common if ratio[t] > baseline[t] * 1.01)
+# Use ±5% AND ±5µs threshold for improved/regressed classification
+# Times are in microseconds
+PCT_THRESHOLD = 0.05  # 5%
+ABS_THRESHOLD = 5     # 5 microseconds
+
+improved = 0
+neutral = 0
+regressed = 0
+for t in common:
+    diff = baseline[t] - ratio[t]  # positive = faster
+    pct_change = diff / baseline[t] if baseline[t] > 0 else 0
+    # Improved: >5% faster AND >5µs faster
+    if pct_change > PCT_THRESHOLD and diff > ABS_THRESHOLD:
+        improved += 1
+    # Regressed: >5% slower AND >5µs slower
+    elif pct_change < -PCT_THRESHOLD and diff < -ABS_THRESHOLD:
+        regressed += 1
+    else:
+        neutral += 1
 
 print("="*80)
 print("RATIO-BASED vs BASELINE COMPARISON")
 print("="*80)
 print(f"Total tests: {len(common)}")
-print(f"\nBaseline total:     {total_baseline:.2f} ms")
-print(f"Ratio-based total:  {total_ratio:.2f} ms")
+print(f"\nBaseline total:     {total_baseline:.2f} us")
+print(f"Ratio-based total:  {total_ratio:.2f} us")
 print(f"Overall speedup:    {speedup:.2f}x")
 print(f"Overall improvement: {(1 - total_ratio/total_baseline)*100:+.2f}%")
-print(f"\nTests improved:  {improved}/{len(common)} ({improved/len(common)*100:.1f}%)")
+print(f"\nTests improved:  {improved}/{len(common)} ({improved/len(common)*100:.1f}%)  [>5% AND >5µs faster]")
 print(f"Tests neutral:   {neutral}/{len(common)} ({neutral/len(common)*100:.1f}%)")
-print(f"Tests regressed: {regressed}/{len(common)} ({regressed/len(common)*100:.1f}%)")
+print(f"Tests regressed: {regressed}/{len(common)} ({regressed/len(common)*100:.1f}%)  [>5% AND >5µs slower]")
 print("="*80)
 
 # Top improvements

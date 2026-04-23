@@ -108,17 +108,34 @@ class ComprehensiveAnalyzer:
         # 2. By index (fallback for backwards compatibility)
         captured_by_config = {}
         captured_by_index = {}
+        captured_by_dims = {}  # Key by extracted dimension arrays
+        
+        def extract_dim_key(s):
+            """Extract dimension arrays from test config for matching"""
+            import re
+            # Find all dimension arrays like [[128, 2119936], [2119936, 128]]
+            matches = re.findall(r'\[\[[\d,\s]+\],\s*\[[\d,\s]+\]\]', s)
+            if matches:
+                # Normalize: remove spaces, sort dimensions
+                return '|'.join(sorted(matches))
+            return None
+        
         for idx, cap_dim in enumerate(self.captured_dimensions):
             captured_by_index[idx] = cap_dim
             # Use test_config if available (new format)
             test_config = cap_dim.get('test_config')
             if test_config:
+                # Store under original
                 captured_by_config[test_config] = cap_dim
+                # Also store by extracted dimension arrays for fuzzy matching
+                dim_key = extract_dim_key(test_config)
+                if dim_key:
+                    captured_by_dims[dim_key] = cap_dim
         
         for test_idx, (test_name, analysis) in enumerate(self.analyses.items()):
             csv_data = analysis['csv_data']
             
-            # Parse dimensions from arguments string
+            # Parse dimensions from arguments string (fallback)
             args = csv_data.get('arguments', '')
             dims = self._parse_arguments(args)
             
@@ -126,20 +143,55 @@ class ComprehensiveAnalyzer:
             n = dims['n']
             k = dims['k']
             
-            # If parsing failed (m, n, k all 0), try captured dimensions
-            # First try matching by test_config (exact match), then fall back to index
+            # Always try captured dimensions first (preferred - accounts for -F parameter)
+            # Match by test_config (exact match), then by dims, then by index
             cap_dim = None
-            if m == 0 and n == 0 and k == 0:
-                if test_name in captured_by_config:
-                    cap_dim = captured_by_config[test_name]
-                elif test_idx in captured_by_index:
+            if test_name in captured_by_config:
+                cap_dim = captured_by_config[test_name]
+            else:
+                # Try matching by extracted dimension arrays
+                dim_key = extract_dim_key(test_name)
+                if dim_key and dim_key in captured_by_dims:
+                    cap_dim = captured_by_dims[dim_key]
+                elif m == 0 and n == 0 and k == 0 and test_idx in captured_by_index:
                     cap_dim = captured_by_index[test_idx]
             
             if cap_dim:
                 if cap_dim.get('type') == 'matmul':
-                    m = cap_dim.get('mSize', 0)
-                    n = cap_dim.get('nSize', 0)
-                    k = cap_dim.get('kSize', 0)
+                    m = cap_dim.get('mSize', m)
+                    n = cap_dim.get('nSize', n)
+                    k = cap_dim.get('kSize', k)
+                    output_size = cap_dim.get('outputSize', 0)
+                    k_size = k if k else 0
+                    
+                    # ratio = kSize / sqrt(outputSize)
+                    ratio = k_size / (output_size ** 0.5) if output_size > 0 else 0.0
+                    
+                    # Convert all_runtimes keys from strings to ints (except "baseline")
+                    all_runtimes = analysis.get('all_runtimes', {})
+                    if all_runtimes:
+                        converted = {}
+                        for rk, rv in all_runtimes.items():
+                            if rk == "baseline" or (isinstance(rk, str) and rk.lower() == "baseline"):
+                                converted["baseline"] = float(rv)
+                            else:
+                                converted[int(rk)] = float(rv)
+                        all_runtimes = converted
+                    
+                    characteristics.append(TestCharacteristics(
+                        test_name=test_name,
+                        best_limit=analysis['best_limit'],
+                        best_runtime=analysis['best_runtime'],
+                        speedup=analysis['speedup_vs_worst'],
+                        output_size=output_size,
+                        k_size=k_size,
+                        ratio=ratio,
+                        m=m,
+                        n=n,
+                        k=k,
+                        all_runtimes=all_runtimes
+                    ))
+                    continue
                 elif cap_dim.get('type') == 'conv':
                     # For conv, use outputSize and reductionSize directly
                     output_size = cap_dim.get('outputSize', 0)
@@ -172,32 +224,12 @@ class ComprehensiveAnalyzer:
                     ))
                     continue
             
-            # Calculate characteristics
+            # Fallback: no captured dimensions found, use parsed values
             output_size = m * n if (m and n) else 0
             k_size = k if k else 0
             
-            # If we still have 0s and have captured dimensions for this test, use them
-            # First try matching by test_config (exact match), then fall back to index
-            cap_dim_fallback = None
-            if output_size == 0 or k_size == 0:
-                if test_name in captured_by_config:
-                    cap_dim_fallback = captured_by_config[test_name]
-                elif test_idx in captured_by_index:
-                    cap_dim_fallback = captured_by_index[test_idx]
-            
-            if cap_dim_fallback and cap_dim_fallback.get('type') == 'matmul':
-                if output_size == 0:
-                    output_size = cap_dim_fallback.get('outputSize', 0)
-                if k_size == 0:
-                    k_size = cap_dim_fallback.get('kSize', 0)
-                if m == 0:
-                    m = cap_dim_fallback.get('mSize', 0)
-                if n == 0:
-                    n = cap_dim_fallback.get('nSize', 0)
-                if k == 0:
-                    k = cap_dim_fallback.get('kSize', 0)
-            
-            ratio = k_size / output_size if output_size > 0 else 0.0
+            # ratio = kSize / sqrt(outputSize)
+            ratio = k_size / (output_size ** 0.5) if output_size > 0 else 0.0
             
             # Convert all_runtimes keys from strings to ints (except "baseline")
             all_runtimes = analysis.get('all_runtimes', {})
@@ -532,8 +564,26 @@ class ComprehensiveAnalyzer:
                 'avg_speedup': stats['performance']['avg_speedup']
             })
         
-        # Sort by minimum output_size (establish clear ordering)
-        cluster_stats.sort(key=lambda x: x['min_output_size'])
+        # Sort by median output_size (establish clear ordering based on typical values)
+        cluster_stats.sort(key=lambda x: x['median_output_size'])
+        
+        # Fix adjacent monotonicity violations by swapping entries with close medians.
+        # This handles cases like limit=8 (median=147K) appearing before limit=16 (median=226K)
+        # where swapping produces a clean monotonically decreasing limit sequence.
+        swapped = True
+        while swapped:
+            swapped = False
+            for i in range(len(cluster_stats) - 1):
+                curr_limit = cluster_stats[i]['limit']
+                next_limit = cluster_stats[i + 1]['limit']
+                if curr_limit < next_limit:
+                    # Limit values are not monotonically decreasing - check if swap is justified
+                    curr_median = cluster_stats[i]['median_output_size']
+                    next_median = cluster_stats[i + 1]['median_output_size']
+                    ratio = next_median / curr_median if curr_median > 0 else float('inf')
+                    if ratio < 5.0:  # Medians within 5x - close enough to justify swap
+                        cluster_stats[i], cluster_stats[i + 1] = cluster_stats[i + 1], cluster_stats[i]
+                        swapped = True
         
         # Merge or re-order clusters that have significant overlap
         # This handles cases where similar output_sizes got assigned to different limits
@@ -552,9 +602,14 @@ class ComprehensiveAnalyzer:
                 
                 # Find a unique threshold that separates this cluster from the next
                 if current_max >= next_min:
-                    # Overlap exists - use a point between current_min and next_min
-                    # that avoids collision with already-used thresholds
-                    threshold = (current_max + next_min) // 2
+                    # Overlap exists - use geometric mean of medians for stable threshold
+                    # This avoids outlier-driven distortion from extreme max/min values
+                    curr_median = cluster_info['median_output_size']
+                    next_median = cluster_stats[i + 1]['median_output_size']
+                    if curr_median > 0 and next_median > 0 and curr_median != next_median:
+                        threshold = int((curr_median * next_median) ** 0.5)
+                    else:
+                        threshold = curr_median if curr_median > 0 else (current_max + next_min) // 2
                     
                     # Ensure uniqueness
                     while threshold in used_thresholds and threshold < current_max * 2:
@@ -573,12 +628,19 @@ class ComprehensiveAnalyzer:
                 # Common square thresholds for convolution/matmul dimensions
                 square_sizes = [
                     16*16,      # 256
+                    24*24,      # 576
                     32*32,      # 1,024
+                    48*48,      # 2,304
                     64*64,      # 4,096
+                    96*96,      # 9,216
                     128*128,    # 16,384
+                    192*192,    # 36,864
                     256*256,    # 65,536
+                    336*336,    # 112,896
                     384*384,    # 147,456
+                    432*432,    # 186,624
                     512*512,    # 262,144
+                    768*768,    # 589,824
                     864*864,    # 746,496
                     1024*1024,  # 1,048,576
                     1728*1728,  # 2,985,984
@@ -647,9 +709,8 @@ class ComprehensiveAnalyzer:
         
         thresholds = cleaned_clusters
         
-        # Merge clusters with very close thresholds (within 50% of each other)
-        # This reduces overfitting and creates more general, robust heuristics
-        # Aligns with user feedback to avoid too fine-grained recommendations
+        # Merge clusters with very close thresholds
+        # Use conservative tolerance to preserve fine-grained limit distinctions
         merged_thresholds = []
         i = 0
         while i < len(thresholds):
@@ -666,18 +727,20 @@ class ComprehensiveAnalyzer:
                 if next_cluster['threshold'] is None:
                     break
                 
-                # Check if thresholds are within 50% of each other
-                # Also merge if both thresholds are small (< 10000) and within 2x of each other
+                # Check if thresholds are close enough to merge
                 if current['threshold'] and next_cluster['threshold']:
                     threshold_diff = abs(next_cluster['threshold'] - current['threshold']) / current['threshold']
                     
-                    # More aggressive merging for small thresholds
+                    # Conservative merging to preserve fine-grained limits (8, 16, 32, etc.)
                     if current['threshold'] < 10000:
-                        merge_tolerance = 1.0  # Within 100% (2x) for small thresholds
+                        merge_tolerance = 0.30  # Within 30% for small thresholds
                     else:
-                        merge_tolerance = 0.50  # Within 50% for larger thresholds
+                        merge_tolerance = 0.20  # Within 20% for larger thresholds
                     
-                    if threshold_diff < merge_tolerance:
+                    # Also check limit ratio - don't merge clusters with very different limits
+                    limit_ratio = max(current['limit'], next_cluster['limit']) / min(current['limit'], next_cluster['limit']) if min(current['limit'], next_cluster['limit']) > 0 else float('inf')
+                    
+                    if threshold_diff < merge_tolerance and limit_ratio < 1.5:
                         merge_group.append(next_cluster)
                         j += 1
                     else:
@@ -766,9 +829,27 @@ class ComprehensiveAnalyzer:
             is_duplicate = False
             if i > 0 and deduplicated:
                 prev_thresh = deduplicated[-1]['threshold']
-                # Check for exact equality
+                prev_limit = deduplicated[-1]['limit']
+                # Check for exact equality - but only treat as duplicate if limits are similar
                 if prev_thresh is not None and t_val is not None and prev_thresh == t_val:
-                    is_duplicate = True
+                    limit_ratio = max(prev_limit, thresh['limit']) / min(prev_limit, thresh['limit']) if min(prev_limit, thresh['limit']) > 0 else float('inf')
+                    if limit_ratio < 2.0:  # Only merge if limits are within 2x
+                        is_duplicate = True
+                    else:
+                        # Different limits with same threshold - bump to next clean square size
+                        import math
+                        bump_target = int(t_val * 1.2)
+                        clean_squares = [
+                            s*s for s in [16,24,32,48,64,96,128,192,256,336,384,432,512,768,864,1024,1728,2048,3072,3456,4096]
+                        ]
+                        next_squares = [s for s in clean_squares if s > t_val]
+                        if next_squares:
+                            t_val = next_squares[0]
+                        else:
+                            sqrt_v = int(math.sqrt(bump_target)) + 1
+                            t_val = sqrt_v * sqrt_v
+                        thresh = dict(thresh)  # copy
+                        thresh['threshold'] = t_val
             
             if t_val is None:
                 # Always keep the else case
@@ -800,9 +881,39 @@ class ComprehensiveAnalyzer:
                         max(deduplicated[-1]['output_size_range'][1], thresh['output_size_range'][1])
                     ]
         
+        # Post-process: absorb very small clusters (< 5 tests) into neighbors
+        # This prevents overly specific branches for few test cases
+        final_thresholds = []
+        for t in deduplicated:
+            if t['count'] < 5 and t['threshold'] is not None:
+                # Try to merge into next entry (by skipping this one)
+                # The next entry will naturally absorb this range
+                if final_thresholds:
+                    # Extend previous entry's threshold to cover this one
+                    final_thresholds[-1]['threshold'] = t['threshold']
+                    final_thresholds[-1]['count'] += t['count']
+                    final_thresholds[-1]['output_size_range'][1] = max(
+                        final_thresholds[-1]['output_size_range'][1], 
+                        t['output_size_range'][1]
+                    )
+                else:
+                    # First entry is tiny - buffer it
+                    final_thresholds.append(t)
+            else:
+                if final_thresholds and final_thresholds[-1]['count'] < 3:
+                    # Previous buffered tiny entry - absorb it into this one
+                    t['count'] += final_thresholds[-1]['count']
+                    t['output_size_range'][0] = min(
+                        t['output_size_range'][0],
+                        final_thresholds[-1]['output_size_range'][0]
+                    )
+                    final_thresholds[-1] = t
+                else:
+                    final_thresholds.append(t)
+        
         return {
-            'thresholds': deduplicated,
-            'sorted_limits': [t['limit'] for t in deduplicated]
+            'thresholds': final_thresholds,
+            'sorted_limits': [t['limit'] for t in final_thresholds]
         }
     
     def detect_dataset_type(self, characteristics: List[TestCharacteristics]) -> str:
@@ -1066,15 +1177,15 @@ class ComprehensiveAnalyzer:
                 else_speedup = thresh['avg_speedup']
                 break
         
-        # Use the data-driven else_limit, or default to 16 if not found
-        # NOTE: limit=1 effectively disables split reduction (returns std::nullopt)
-        # So we use a minimum of 8 for the else clause to ensure split reduction happens
-        if else_limit is None or else_limit < 8:
-            else_limit = 8  # Minimum viable limit for else clause
+        # Use the data-driven else_limit, or default to 8 if not found
+        if else_limit is None:
+            else_limit = 8  # Default if no data
         
         code_lines.append(f"  }} else {{  // {else_count} tests, avg speedup: {else_speedup:.2f}x")
-        # Use the actual limit from data, with tileSizes[0] constraint only for small limits
-        if else_limit <= 16:
+        # Use the actual limit from data, with tileSizes[0] constraint for moderate limits
+        if else_limit == 1:
+            code_lines.append(f"    limitParallelLoops = 1;")
+        elif else_limit <= 16:
             code_lines.append(f"    limitParallelLoops = std::min<int64_t>({else_limit}, tileSizes[0]);")
         else:
             code_lines.append(f"    limitParallelLoops = {else_limit};")
@@ -1180,11 +1291,11 @@ class ComprehensiveAnalyzer:
                 limit_stats[limit] = metrics
                 
                 lines.append(f"limitParallelLoops = {limit}:")
-                lines.append(f"  Geometric Mean:   {metrics['geometric_mean']:.2f} ms")
-                lines.append(f"  Arithmetic Mean:  {metrics['arithmetic_mean']:.2f} ms")
-                lines.append(f"  Median:           {metrics['median']:.2f} ms")
-                lines.append(f"  P95:              {metrics['p95']:.2f} ms")
-                lines.append(f"  Total Runtime:    {metrics['total_runtime']:.0f} ms")
+                lines.append(f"  Geometric Mean:   {metrics['geometric_mean']:.2f} µs")
+                lines.append(f"  Arithmetic Mean:  {metrics['arithmetic_mean']:.2f} µs")
+                lines.append(f"  Median:           {metrics['median']:.2f} µs")
+                lines.append(f"  P95:              {metrics['p95']:.2f} µs")
+                lines.append(f"  Total Runtime:    {metrics['total_runtime']:.0f} µs")
                 lines.append("")
         
         # Ranking by geometric mean (exclude baseline from ranking - it's the reference, not a candidate)
@@ -1197,7 +1308,7 @@ class ComprehensiveAnalyzer:
             lines.append("Ranking by Geometric Mean (excluding baseline):")
             for rank, (limit, metrics) in enumerate(ranked_limits, 1):
                 best_marker = " ⭐ BEST OVERALL" if rank == 1 else ""
-                lines.append(f"  #{rank}: limit={limit} (GeoMean: {metrics['geometric_mean']:.2f}ms){best_marker}")
+                lines.append(f"  #{rank}: limit={limit} (GeoMean: {metrics['geometric_mean']:.2f}µs){best_marker}")
             lines.append("")
         else:
             ranked_limits = []
@@ -1256,7 +1367,7 @@ class ComprehensiveAnalyzer:
             lines.append(f"  Test count:       {stats['count']}")
             lines.append(f"  Output size:      {stats['output_size']['min']:,} - {stats['output_size']['max']:,} (median: {stats['output_size']['median']:,})")
             lines.append(f"  K size:           {stats['k_size']['min']:,} - {stats['k_size']['max']:,} (median: {stats['k_size']['median']:,})")
-            lines.append(f"  Avg runtime:      {stats['performance']['avg_runtime_ms']:.2f} ms")
+            lines.append(f"  Avg runtime:      {stats['performance']['avg_runtime_ms']:.2f} µs")
             lines.append(f"  Avg speedup:      {stats['performance']['avg_speedup']:.2f}x")
             lines.append("")
             
@@ -1265,7 +1376,7 @@ class ComprehensiveAnalyzer:
                 lines.append("  Examples:")
                 for char in cluster:
                     lines.append(f"    • {char.test_name[:70]}...")
-                    lines.append(f"      Runtime: {char.best_runtime:.2f}ms, Speedup: {char.speedup:.2f}x")
+                    lines.append(f"      Runtime: {char.best_runtime:.2f}µs, Speedup: {char.speedup:.2f}x")
                 lines.append("")
         
         # PART 4: Threshold Recommendations
@@ -1386,7 +1497,7 @@ class ComprehensiveAnalyzer:
         sorted_chars = sorted(characteristics, key=lambda c: c.speedup, reverse=True)[:20]
         for i, char in enumerate(sorted_chars, 1):
             lines.append(f"#{i}: {char.test_name[:70]}...")
-            lines.append(f"     Best limit: {char.best_limit}, Runtime: {char.best_runtime:.2f}ms, Speedup: {char.speedup:.2f}x")
+            lines.append(f"     Best limit: {char.best_limit}, Runtime: {char.best_runtime:.2f}µs, Speedup: {char.speedup:.2f}x")
             lines.append(f"     OutputSize: {char.output_size:,}, KSize: {char.k_size:,}")
             lines.append("")
         
@@ -1415,19 +1526,27 @@ class ComprehensiveAnalyzer:
                 total_optimized = 0
                 geomean_ratios = []
                 
+                # Use ±5% AND ±5µs threshold for improved/regressed classification
+                # Times are in microseconds
+                PCT_THRESHOLD = 0.05  # 5%
+                ABS_THRESHOLD = 5     # 5 microseconds
+                
                 for test_name, optimized_time in optimized_results.items():
                     if test_name in baseline_results:
                         baseline_time = baseline_results[test_name]
                         total_baseline += baseline_time
                         total_optimized += optimized_time
                         
-                        speedup = baseline_time / optimized_time
-                        improvement_pct = ((baseline_time - optimized_time) / baseline_time) * 100
+                        speedup = baseline_time / optimized_time if optimized_time > 0 else 0
+                        diff = baseline_time - optimized_time  # positive = faster (improved)
+                        improvement_pct = (diff / baseline_time) * 100 if baseline_time > 0 else 0
                         geomean_ratios.append(speedup)
                         
-                        if speedup > 1.05:  # >5% improvement
+                        # Improved: >5% faster AND >5µs faster
+                        if improvement_pct > PCT_THRESHOLD * 100 and diff > ABS_THRESHOLD:
                             improvements.append((test_name, speedup, improvement_pct, baseline_time, optimized_time))
-                        elif speedup < 0.95:  # >5% regression
+                        # Regressed: >5% slower AND >5µs slower
+                        elif improvement_pct < -PCT_THRESHOLD * 100 and diff < -ABS_THRESHOLD:
                             regressions.append((test_name, speedup, improvement_pct, baseline_time, optimized_time))
                         else:
                             neutral.append((test_name, speedup, improvement_pct, baseline_time, optimized_time))
@@ -1451,15 +1570,15 @@ class ComprehensiveAnalyzer:
                 lines.append("│                    BASELINE vs OPTIMIZED                                 │")
                 lines.append("├─────────────────────────────────────────────────────────────────────────┤")
                 lines.append(f"│ Total Tests:          {total_tests:>10}                                       │")
-                lines.append(f"│ Baseline Runtime:     {total_baseline:>10.0f} ms  (~{total_baseline/60000:.1f} min)                  │")
-                lines.append(f"│ Optimized Runtime:    {total_optimized:>10.0f} ms  (~{total_optimized/60000:.1f} min)                  │")
+                lines.append(f"│ Baseline Runtime:     {total_baseline:>10.0f} µs  (~{total_baseline/1000000:.2f} sec)                 │")
+                lines.append(f"│ Optimized Runtime:    {total_optimized:>10.0f} µs  (~{total_optimized/1000000:.2f} sec)                 │")
                 lines.append(f"│ Overall Speedup:      {overall_speedup:>10.2f}x                                      │")
                 lines.append(f"│ Overall Improvement:  {overall_improvement:>10.2f}%                                      │")
                 lines.append(f"│ Geometric Mean:       {geomean_speedup:>10.2f}x                                      │")
                 lines.append("├─────────────────────────────────────────────────────────────────────────┤")
-                lines.append(f"│ Tests Improved:       {len(improvements):>10} ({len(improvements)/total_tests*100:>5.1f}%)                            │")
-                lines.append(f"│ Tests Neutral (±5%):  {len(neutral):>10} ({len(neutral)/total_tests*100:>5.1f}%)                            │")
-                lines.append(f"│ Tests Regressed:      {len(regressions):>10} ({len(regressions)/total_tests*100:>5.1f}%)                            │")
+                lines.append(f"│ Tests Improved:       {len(improvements):>10} ({len(improvements)/total_tests*100:>5.1f}%)  [>5% AND >5µs faster]  │")
+                lines.append(f"│ Tests Neutral:        {len(neutral):>10} ({len(neutral)/total_tests*100:>5.1f}%)                            │")
+                lines.append(f"│ Tests Regressed:      {len(regressions):>10} ({len(regressions)/total_tests*100:>5.1f}%)  [>5% AND >5µs slower]  │")
                 lines.append("└─────────────────────────────────────────────────────────────────────────┘")
                 lines.append("")
                 
@@ -1468,7 +1587,7 @@ class ComprehensiveAnalyzer:
                     lines.append(f"Top 15 Improvements:")
                     lines.append("")
                     for i, (test, speedup, improvement, base, opt) in enumerate(improvements[:15], 1):
-                        lines.append(f"{i:2d}. {speedup:6.2f}x ({improvement:+6.2f}%) | Baseline: {base:8.0f}ms → Optimized: {opt:8.0f}ms")
+                        lines.append(f"{i:2d}. {speedup:6.2f}x ({improvement:+6.2f}%) | Baseline: {base:8.0f}µs → Optimized: {opt:8.0f}µs")
                         lines.append(f"    {test[:75]}")
                         if i < 15 and i < len(improvements):
                             lines.append("")
@@ -1476,10 +1595,10 @@ class ComprehensiveAnalyzer:
                 
                 # Regressions (if any)
                 if regressions:
-                    lines.append(f"Regressions (>5% slower):")
+                    lines.append(f"Regressions (>5% AND >5µs slower):")
                     lines.append("")
                     for i, (test, speedup, improvement, base, opt) in enumerate(regressions, 1):
-                        lines.append(f"{i:2d}. {speedup:6.2f}x ({improvement:+6.2f}%) | Baseline: {base:8.0f}ms → Optimized: {opt:8.0f}ms")
+                        lines.append(f"{i:2d}. {speedup:6.2f}x ({improvement:+6.2f}%) | Baseline: {base:8.0f}µs → Optimized: {opt:8.0f}µs")
                         lines.append(f"    {test[:75]}")
                         lines.append("")
                 
@@ -1489,16 +1608,33 @@ class ComprehensiveAnalyzer:
                 lines.append("="*100)
                 lines.append("")
                 
-                if len(regressions) == 0:
+                # Consider both overall speedup AND regression count for recommendation
+                is_overall_faster = overall_speedup >= 0.99  # At least as fast as baseline
+                is_overall_much_faster = overall_speedup >= 1.05  # 5% faster overall
+                low_regression_count = len(regressions) / total_tests < 0.05 if total_tests > 0 else True
+                
+                if len(regressions) == 0 and is_overall_faster:
                     lines.append("✅ EXCELLENT RESULTS - READY FOR PRODUCTION")
                     lines.append("")
                     lines.append(f"The optimized configuration shows {overall_speedup:.2f}x overall speedup with")
                     lines.append("ZERO regressions. This is a safe, high-impact optimization.")
-                elif len(regressions) / total_tests < 0.05:
+                elif is_overall_much_faster and low_regression_count:
                     lines.append("✅ STRONG RESULTS - RECOMMENDED FOR PRODUCTION")
                     lines.append("")
                     lines.append(f"The optimized configuration shows {overall_speedup:.2f}x overall speedup with")
                     lines.append(f"only {len(regressions)} regressions ({len(regressions)/total_tests*100:.1f}% of tests).")
+                elif overall_speedup < 0.95:
+                    # Overall slowdown of more than 5%
+                    lines.append("❌ POOR RESULTS - OVERALL REGRESSION")
+                    lines.append("")
+                    lines.append(f"The optimized configuration is {1/overall_speedup:.2f}x SLOWER overall.")
+                    lines.append(f"Total baseline: {total_baseline:.0f}µs → Total optimized: {total_optimized:.0f}µs")
+                    lines.append(f"This indicates the optimization is counterproductive for this workload.")
+                elif not is_overall_faster:
+                    lines.append("⚠️  MARGINAL RESULTS - NOT RECOMMENDED")
+                    lines.append("")
+                    lines.append(f"The optimized configuration shows {overall_speedup:.2f}x overall speedup,")
+                    lines.append(f"which is not an improvement. Consider reverting or further tuning.")
                 else:
                     lines.append("⚠️  MIXED RESULTS - REVIEW RECOMMENDED")
                     lines.append("")
@@ -1561,8 +1697,8 @@ class ComprehensiveAnalyzer:
             lines.append("")
             
             # Header for the table
-            lines.append(f"{'#':<4} {'Test Config':<50} {'Baseline(ms)':>12} {'Optimized(ms)':>13} {'Speedup':>10} {'Ratio':>12}")
-            lines.append("-"*110)
+            lines.append(f"{'#':<4} {'Test Config':<50} {'Baseline(ms)':>12} {'Optimized(ms)':>13} {'Speedup':>10} {'Ratio':>12} {'OutputSize':>12}")
+            lines.append("-"*125)
             
             # Collect and sort by speedup
             test_details = []
@@ -1610,7 +1746,8 @@ class ComprehensiveAnalyzer:
                 speedup_str = f"{detail['speedup']:.2f}x" if detail['speedup'] > 0 else "N/A"
                 ratio_str = f"{detail['ratio']:.2f}" if detail['ratio'] > 0 else "N/A"
                 
-                lines.append(f"{i:<4} {test_name:<50} {baseline_str:>12} {optimized_str:>13} {speedup_str:>10} {ratio_str:>12}")
+                output_size_str = str(detail['output_size']) if detail['output_size'] > 0 else "N/A"
+                lines.append(f"{i:<4} {test_name:<50} {baseline_str:>12} {optimized_str:>13} {speedup_str:>10} {ratio_str:>12} {output_size_str:>12}")
             
             lines.append("")
             
