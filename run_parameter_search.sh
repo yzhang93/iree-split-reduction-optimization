@@ -18,9 +18,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CPP_FILE="../iree/compiler/src/iree/compiler/DispatchCreation/SetSplitReductionSizes.cpp"
 IREE_BUILD_DIR="../iree-build"
 TURBINE_DIR="../iree-turbine"
-# This machine has a single AMD GPU (ROCm), so device index is 0.
+# GPU configuration — distribute benchmark work across these devices.
 # Use HIP_VISIBLE_DEVICES (not CUDA_VISIBLE_DEVICES) for ROCm/HIP builds of PyTorch.
-GPU_ID=0
+GPU_IDS=(2 3 4 5 6 7)
+GPU_ID=${GPU_IDS[0]}  # Default single GPU for baseline dimension capture
 
 # Check if running in split_reduction_optimization directory
 if [[ ! -f "optimize_single_limit.py" ]]; then
@@ -81,7 +82,9 @@ test_optimized_config() {
     echo ""
     echo "Running benchmarks with optimized configuration..."
     
-    # Run benchmarks for each test file
+    local num_gpus=${#GPU_IDS[@]}
+    
+    # Run benchmarks for each test file using multi-GPU
     for test_file in "${test_files_abs[@]}"; do
         if [ ! -f "$test_file" ]; then
             echo "⚠️  Test file not found: $test_file"
@@ -90,52 +93,107 @@ test_optimized_config() {
         
         test_basename=$(basename "$test_file" .txt)
         csv_file="$results_dir/optimized_config_${test_basename}.csv"
+        local total_shapes=$(wc -l < "$test_file")
         
-        echo "  Testing $(basename $test_file)..."
+        echo "  Testing $(basename $test_file) ($total_shapes shapes across $num_gpus GPUs: ${GPU_IDS[*]})..."
         
-        # Create temporary benchmark script for complete environment isolation
-        cat > "$results_dir/_run_opt_bench.sh" << EOFSCRIPT
-#!/bin/bash
-set -e
-
-# Set up IREE environment
-export PATH="$IREE_BUILD_DIR/tools:\$PATH"
-export PYTHONPATH="$IREE_BUILD_DIR/compiler/bindings/python:\$PYTHONPATH"
-export HIP_VISIBLE_DEVICES=$GPU_ID
-export CUDA_VISIBLE_DEVICES=$GPU_ID
-
-# Activate turbine venv and load .env
-cd "$TURBINE_DIR"
-source .venv/bin/activate
-if [ -f .env ]; then
-    source .env
-    export PYTHONPATH
-fi
-
-# Run benchmark
-python3 iree/turbine/kernel/boo/driver/driver.py \\
-    --commands-file="$test_file" \\
-    --csv="$csv_file"
-EOFSCRIPT
+        # Clear BOO cache
+        rm -rf /home/vivizhan/.cache/turbine_kernels/boo/
         
-        chmod +x "$results_dir/_run_opt_bench.sh"
-        
-        # Run benchmark (output redirected to log file)
-        if "$results_dir/_run_opt_bench.sh" > "$results_dir/_bench_output.log" 2>&1; then
-            if [ -f "$csv_file" ]; then
-                echo "  ✓ Completed $(basename $test_file)"
+        # Split shapes into per-GPU chunks
+        local chunk_prefix="$results_dir/_opt_chunk"
+        local base_size=$(( total_shapes / num_gpus ))
+        local chunk_remainder=$(( total_shapes % num_gpus ))
+        local offset=1
+        for (( gi = 0; gi < num_gpus; gi++ )); do
+            local chunk_size=$base_size
+            if (( gi < chunk_remainder )); then
+                (( chunk_size++ ))
+            fi
+            if (( chunk_size > 0 )); then
+                sed -n "${offset},$(( offset + chunk_size - 1 ))p" "$test_file" > "${chunk_prefix}_${gi}"
             else
-                echo "  ❌ Benchmark completed but no CSV file created"
+                > "${chunk_prefix}_${gi}"
             fi
+            (( offset += chunk_size ))
+        done
+        
+        # Set up environment and launch parallel benchmarks
+        export PATH="$IREE_BUILD_DIR/tools:$PATH"
+        cd "$TURBINE_DIR"
+        source .venv/bin/activate
+        if [ -f .env ]; then source .env; export PYTHONPATH; fi
+        
+        local pids=()
+        local part_csvs=()
+        for (( gi = 0; gi < num_gpus; gi++ )); do
+            local chunk_file="${chunk_prefix}_${gi}"
+            if [ ! -s "$chunk_file" ]; then
+                continue
+            fi
+            local part_csv="$results_dir/_opt_part_${gi}.csv"
+            part_csvs+=("$part_csv")
+            
+            CUDA_VISIBLE_DEVICES="${GPU_IDS[$gi]}" \
+            python "$TURBINE_DIR/iree/turbine/kernel/boo/driver/driver.py" \
+                --commands-file "$chunk_file" \
+                --csv "$part_csv" > /dev/null 2>&1 &
+            pids+=($!)
+        done
+        
+        # Monitor progress
+        local any_running=true
+        while $any_running; do
+            any_running=false
+            for pid in "${pids[@]}"; do
+                if kill -0 "$pid" 2>/dev/null; then
+                    any_running=true
+                    break
+                fi
+            done
+            local completed=0
+            for part_csv in "${part_csvs[@]}"; do
+                if [[ -f "$part_csv" ]]; then
+                    local lines
+                    lines=$(wc -l < "$part_csv")
+                    (( lines > 1 )) && (( completed += lines - 1 ))
+                fi
+            done
+            printf "\r    Progress: %d/%d ..." "$completed" "$total_shapes"
+            sleep 2
+        done
+        
+        # Wait for all
+        for pid in "${pids[@]}"; do
+            wait "$pid" 2>/dev/null || true
+        done
+        
+        # Merge per-GPU CSVs
+        local first=true
+        for part_csv in "${part_csvs[@]}"; do
+            if [[ -f "$part_csv" ]]; then
+                if $first; then
+                    cat "$part_csv" > "$csv_file"
+                    first=false
+                else
+                    tail -n +2 "$part_csv" >> "$csv_file"
+                fi
+            fi
+        done
+        
+        # Clean up
+        for (( gi = 0; gi < num_gpus; gi++ )); do
+            rm -f "${chunk_prefix}_${gi}" "$results_dir/_opt_part_${gi}.csv"
+        done
+        
+        if [[ -f "$csv_file" ]]; then
+            printf "\r  ✓ Completed $(basename $test_file)                    \n"
         else
+            echo ""
             echo "  ❌ Benchmark failed for $(basename $test_file)"
-            echo "     Last 20 lines of output:"
-            if [ -f "$results_dir/_bench_output.log" ]; then
-                tail -20 "$results_dir/_bench_output.log" | sed "s/^/     /"
-            fi
         fi
         
-        rm -f "$results_dir/_run_opt_bench.sh"
+        cd "$SCRIPT_DIR"
     done
     
     echo ""
@@ -200,7 +258,7 @@ case "$MODE" in
         echo "Quick mode: Testing 4 values (including no-split baseline)"
         ;;
     full)
-        LIMITS=(1 8 16 32 64 128 256 1024)
+        LIMITS=(1 8 16 32 64 128 256 1024 2048)
         echo "Full mode: Testing 10 values (including no-split baseline)"
         ;;
     analyze)
@@ -277,7 +335,7 @@ echo "C++ File: $CPP_FILE"
 echo "IREE Build: $IREE_BUILD_DIR"
 echo "Turbine: $TURBINE_DIR"
 echo "Results: $RESULTS_DIR"
-echo "GPU ID: $GPU_ID"
+echo "GPU IDs: ${GPU_IDS[*]}"
 echo "Limits to test: ${LIMITS[@]}"
 echo "Test Files:"
 for file in "${TEST_FILES_ABS[@]}"; do
@@ -465,150 +523,157 @@ fi
 echo "✓ Build successful"
 cd "$SCRIPT_DIR"
 
-# Step 4: Run baseline and capture dimension logs (ONE TEST AT A TIME for proper correlation)
-echo "Step 4: Running baseline with dimension capture (test-by-test)..."
+# Step 4: Run baseline with dimension capture across multiple GPUs.
+# Each GPU gets a chunk of shapes and its own dimension log file.
+# The per-GPU logs are merged afterwards for dimension parsing.
+echo "Step 4: Running baseline with dimension capture (multi-GPU)..."
 
-# Create single-test benchmark script
-cat > "$RESULTS_DIR/_run_single_test.py" << 'PYEOF'
-#!/usr/bin/env python3
-"""Run a single test and log its configuration to the dimension log file."""
-import sys
-import os
-import subprocess
-import csv
-import tempfile
+NUM_GPUS=${#GPU_IDS[@]}
 
-def run_single_test(test_config, csv_output, dimension_log, turbine_dir, iree_build_dir, gpu_id):
-    """Run a single benchmark test with dimension logging."""
-    
-    # Log the test configuration BEFORE compilation/running
-    with open(dimension_log, 'a') as f:
-        f.write(f"[TEST_CONFIG] {test_config}\n")
-        f.flush()
-    
-    # Create a temporary file with just this one test
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp:
-        tmp.write(test_config + '\n')
-        tmp_file = tmp.name
-    
-    try:
-        # Set up environment
-        env = os.environ.copy()
-        env['PATH'] = f"{iree_build_dir}/tools:" + env.get('PATH', '')
-        env['PYTHONPATH'] = f"{iree_build_dir}/compiler/bindings/python:" + env.get('PYTHONPATH', '')
-        env['HIP_VISIBLE_DEVICES'] = str(gpu_id)
-        env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-        
-        # Run from turbine directory
-        original_dir = os.getcwd()
-        os.chdir(turbine_dir)
-        
-        # Source the venv
-        venv_activate = os.path.join(turbine_dir, '.venv/bin/activate')
-        
-        # Create temp CSV for this single test
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as tmp_csv:
-            tmp_csv_file = tmp_csv.name
-        
-        # Build command
-        cmd = f"""
-        source {venv_activate}
-        if [ -f .env ]; then source .env; export PYTHONPATH; fi
-        python3 iree/turbine/kernel/boo/driver/driver.py \
-            --commands-file="{tmp_file}" \
-            --csv="{tmp_csv_file}"
-        """
-        
-        result = subprocess.run(
-            ['bash', '-c', cmd],
-            env=env,
-            capture_output=True,
-            text=True
-        )
-        
-        os.chdir(original_dir)
-        
-        # Read the result from temp CSV and append to main CSV
-        if os.path.exists(tmp_csv_file):
-            with open(tmp_csv_file, 'r') as f:
-                reader = csv.reader(f)
-                rows = list(reader)
-            
-            # Write to main CSV (append mode, skip header if file exists)
-            file_exists = os.path.exists(csv_output) and os.path.getsize(csv_output) > 0
-            with open(csv_output, 'a', newline='') as f:
-                writer = csv.writer(f)
-                for i, row in enumerate(rows):
-                    if i == 0 and file_exists:
-                        continue  # Skip header
-                    writer.writerow(row)
-            
-            os.unlink(tmp_csv_file)
-        
-        return result.returncode == 0
-        
-    finally:
-        if os.path.exists(tmp_file):
-            os.unlink(tmp_file)
+# Clear BOO cache
+rm -rf /home/vivizhan/.cache/turbine_kernels/boo/
 
-if __name__ == '__main__':
-    if len(sys.argv) != 7:
-        print("Usage: _run_single_test.py <test_config> <csv_output> <dimension_log> <turbine_dir> <iree_build_dir> <gpu_id>")
-        sys.exit(1)
-    
-    test_config = sys.argv[1]
-    csv_output = sys.argv[2]
-    dimension_log = sys.argv[3]
-    turbine_dir = sys.argv[4]
-    iree_build_dir = sys.argv[5]
-    gpu_id = sys.argv[6]
-    
-    success = run_single_test(test_config, csv_output, dimension_log, turbine_dir, iree_build_dir, gpu_id)
-    sys.exit(0 if success else 1)
-PYEOF
-chmod +x "$RESULTS_DIR/_run_single_test.py"
-
-# Run baseline for each test file
 for test_file in "${TEST_FILES_ABS[@]}"; do
     test_basename=$(basename "$test_file" .txt)
     csv_file="$RESULTS_DIR/limit_baseline_${test_basename}.csv"
-    log_file="$RESULTS_DIR/dimension_log_${test_basename}.txt"
+    total_tests=$(wc -l < "$test_file")
     
-    echo "  Running baseline for $test_basename..."
+    echo "  Running baseline for $test_basename ($total_tests shapes across $NUM_GPUS GPUs: ${GPU_IDS[*]})..."
     
-    # Clear the dimension log file before this test file
-    > "$log_file"
+    # Split shapes into per-GPU chunks
+    local_base_size=$(( total_tests / NUM_GPUS ))
+    local_remainder=$(( total_tests % NUM_GPUS ))
+    local_offset=1
     
-    # Clear the CSV file
-    > "$csv_file"
-    
-    # Count total tests
-    total_tests=$(grep -c . "$test_file" 2>/dev/null || echo "0")
-    current_test=0
-    
-    # Run each test one at a time
-    while IFS= read -r test_config || [ -n "$test_config" ]; do
-        # Skip empty lines
-        [ -z "$test_config" ] && continue
+    # Create per-GPU worker scripts
+    for (( gi = 0; gi < NUM_GPUS; gi++ )); do
+        local_chunk_size=$local_base_size
+        if [ "$gi" -lt "$local_remainder" ]; then
+            local_chunk_size=$(( local_chunk_size + 1 ))
+        fi
+        if [ "$local_chunk_size" -le 0 ]; then
+            continue
+        fi
         
-        current_test=$((current_test + 1))
-        printf "\r    Test %d/%d..." "$current_test" "$total_tests"
+        # Extract chunk
+        chunk_file="$RESULTS_DIR/_baseline_chunk_${gi}.txt"
+        sed -n "${local_offset},$(( local_offset + local_chunk_size - 1 ))p" "$test_file" > "$chunk_file"
+        local_offset=$(( local_offset + local_chunk_size ))
         
-        python3 "$RESULTS_DIR/_run_single_test.py" \
-            "$test_config" \
-            "$csv_file" \
-            "$RESULTS_DIR/iree_dimension_log.txt" \
-            "$TURBINE_DIR" \
-            "$IREE_BUILD_DIR" \
-            "$GPU_ID" 2>/dev/null || true
-            
-    done < "$test_file"
-    
-    echo ""
-    echo "  ✓ Baseline complete for $test_basename ($current_test tests)"
-done
+        # Create per-GPU worker script that runs shapes one-by-one with dim logging
+        cat > "$RESULTS_DIR/_baseline_worker_${gi}.sh" << WORKEREOF
+#!/bin/bash
+export PATH="$IREE_BUILD_DIR/tools:\$PATH"
+export CUDA_VISIBLE_DEVICES=${GPU_IDS[$gi]}
+cd "$TURBINE_DIR"
+source .venv/bin/activate
+if [ -f .env ]; then source .env; export PYTHONPATH; fi
 
-rm -f "$RESULTS_DIR/_run_single_test.py"
+DIM_LOG="$RESULTS_DIR/_baseline_dimlog_${gi}.txt"
+PART_CSV="$RESULTS_DIR/_baseline_part_${gi}.csv"
+
+> "\$DIM_LOG"
+
+while IFS= read -r test_config || [ -n "\$test_config" ]; do
+    [ -z "\$test_config" ] && continue
+    
+    # Write test config marker to dimension log
+    echo "[TEST_CONFIG] \$test_config" >> "\$DIM_LOG"
+    
+    # Create temp file for single test
+    TMP_FILE=\$(mktemp /tmp/baseline_test_${gi}_XXXXXX.txt)
+    echo "\$test_config" > "\$TMP_FILE"
+    TMP_CSV=\$(mktemp /tmp/baseline_csv_${gi}_XXXXXX.csv)
+    
+    python3 iree/turbine/kernel/boo/driver/driver.py \\
+        --commands-file="\$TMP_FILE" \\
+        --csv="\$TMP_CSV" > /dev/null 2>&1 || true
+    
+    # Append to part CSV
+    if [ -f "\$TMP_CSV" ] && [ -s "\$TMP_CSV" ]; then
+        if [ ! -s "\$PART_CSV" ]; then
+            cat "\$TMP_CSV" > "\$PART_CSV"
+        else
+            tail -n +2 "\$TMP_CSV" >> "\$PART_CSV"
+        fi
+    fi
+    
+    rm -f "\$TMP_FILE" "\$TMP_CSV"
+done < "$RESULTS_DIR/_baseline_chunk_${gi}.txt"
+WORKEREOF
+        chmod +x "$RESULTS_DIR/_baseline_worker_${gi}.sh"
+    done
+    
+    # Launch all workers in parallel
+    baseline_pids=()
+    for (( gi = 0; gi < NUM_GPUS; gi++ )); do
+        if [ -f "$RESULTS_DIR/_baseline_worker_${gi}.sh" ]; then
+            "$RESULTS_DIR/_baseline_worker_${gi}.sh" &
+            baseline_pids+=($!)
+        fi
+    done
+    
+    # Monitor progress
+    while true; do
+        any_running=false
+        for pid in "${baseline_pids[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                any_running=true
+                break
+            fi
+        done
+        $any_running || break
+        
+        completed=0
+        for (( gi = 0; gi < NUM_GPUS; gi++ )); do
+            if [ -f "$RESULTS_DIR/_baseline_part_${gi}.csv" ]; then
+                lines=$(wc -l < "$RESULTS_DIR/_baseline_part_${gi}.csv")
+                (( lines > 1 )) && (( completed += lines - 1 ))
+            fi
+        done
+        printf "\r    Progress: %d/%d ..." "$completed" "$total_tests"
+        sleep 2
+    done
+    
+    # Wait for all
+    for pid in "${baseline_pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    
+    # Merge per-GPU CSVs
+    first_csv=true
+    for (( gi = 0; gi < NUM_GPUS; gi++ )); do
+        part="$RESULTS_DIR/_baseline_part_${gi}.csv"
+        if [ -f "$part" ]; then
+            if $first_csv; then
+                cat "$part" > "$csv_file"
+                first_csv=false
+            else
+                tail -n +2 "$part" >> "$csv_file"
+            fi
+        fi
+    done
+    
+    # Merge per-GPU dimension logs into single file
+    > "$RESULTS_DIR/iree_dimension_log.txt"
+    for (( gi = 0; gi < NUM_GPUS; gi++ )); do
+        dimlog="$RESULTS_DIR/_baseline_dimlog_${gi}.txt"
+        if [ -f "$dimlog" ]; then
+            cat "$dimlog" >> "$RESULTS_DIR/iree_dimension_log.txt"
+        fi
+    done
+    
+    # Clean up
+    for (( gi = 0; gi < NUM_GPUS; gi++ )); do
+        rm -f "$RESULTS_DIR/_baseline_chunk_${gi}.txt" \
+              "$RESULTS_DIR/_baseline_worker_${gi}.sh" \
+              "$RESULTS_DIR/_baseline_part_${gi}.csv" \
+              "$RESULTS_DIR/_baseline_dimlog_${gi}.txt"
+    done
+    
+    completed=$(( $(wc -l < "$csv_file") - 1 ))
+    printf "\r  ✓ Baseline complete for $test_basename ($completed tests)          \n"
+done
 
 # Step 5: Parse dimension logs and create JSON (with test configuration matching)
 echo "Step 5: Parsing dimension logs with test configurations..."
@@ -736,6 +801,7 @@ for limit in "${LIMITS[@]}"; do
     
     # Call optimize_single_limit.py for THIS limit only
     # This is a FRESH Python process - no shared state with previous limits!
+    GPU_IDS_STR=$(IFS=,; echo "${GPU_IDS[*]}")
     python3 optimize_single_limit.py \
         --cpp-file "$CPP_FILE" \
         --iree-build-dir "$IREE_BUILD_DIR" \
@@ -743,6 +809,7 @@ for limit in "${LIMITS[@]}"; do
         --results-dir "$RESULTS_DIR" \
         --test-files "${TEST_FILES_ABS[@]}" \
         --gpu-id "$GPU_ID" \
+        --gpu-ids "$GPU_IDS_STR" \
         --limit "$limit"
     
     if [ $? -ne 0 ]; then

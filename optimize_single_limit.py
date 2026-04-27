@@ -245,59 +245,164 @@ class LimitParallelLoopsOptimizer:
         return all_exist
     
     def run_benchmark(self, test_file: Path, limit_value: int, force_rerun: bool = False) -> Optional[Path]:
-        """Run benchmark and return path to CSV results"""
+        """Run benchmark across multiple GPUs and return path to merged CSV results"""
         test_basename = test_file.stem
         csv_file = self.results_dir / f"limit_{limit_value}_{test_basename}.csv"
         
         # Skip if results already exist (unless force_rerun is True)
-        # Note: This shouldn't happen since we check/delete at the top level
         if csv_file.exists() and not force_rerun:
             return csv_file
         
-        # Show progress
+        gpu_ids = self.gpu_ids if hasattr(self, 'gpu_ids') else [self.gpu_id]
+        num_gpus = len(gpu_ids)
+        
+        # Read all test lines
+        with open(test_file) as f:
+            all_lines = [l for l in f.read().strip().split('\n') if l.strip()]
+        total = len(all_lines)
+        
+        if num_gpus <= 1 or total <= 1:
+            # Single GPU path
+            return self._run_benchmark_single_gpu(test_file, csv_file, limit_value, gpu_ids[0])
+        
+        print(f"  Running benchmarks for {test_file.name} ({total} shapes across {num_gpus} GPUs: {gpu_ids}) ...")
+        
+        import shutil as _shutil
+        import time
+        
+        # Clear shared BOO cache to ensure fresh compilations
+        boo_cache = Path.home() / ".cache" / "turbine_kernels" / "boo"
+        if boo_cache.exists():
+            _shutil.rmtree(boo_cache, ignore_errors=True)
+        
+        # Split shapes into per-GPU chunk files
+        chunk_size = total // num_gpus
+        remainder = total % num_gpus
+        chunk_files = []
+        part_csvs = []
+        offset = 0
+        for i in range(num_gpus):
+            sz = chunk_size + (1 if i < remainder else 0)
+            chunk = all_lines[offset:offset+sz]
+            offset += sz
+            if not chunk:
+                continue
+            chunk_file = self.results_dir / f"_chunk_{limit_value}_{i}.txt"
+            chunk_file.write_text('\n'.join(chunk) + '\n')
+            chunk_files.append((i, chunk_file))
+            part_csvs.append(self.results_dir / f"_part_{limit_value}_{i}.csv")
+        
+        # Write a single bash script that sets up env, then launches
+        # parallel driver.py processes (exactly like run_benchmark.sh)
+        turbine_dir = self.turbine_dir.resolve()
+        iree_build_dir = self.iree_build_dir.resolve()
+        
+        launch_lines = []
+        launch_lines.append("PIDS=()")
+        for idx, ((i, chunk_file), part_csv) in enumerate(zip(chunk_files, part_csvs)):
+            gpu_id = gpu_ids[i]
+            launch_lines.append(
+                f'CUDA_VISIBLE_DEVICES="{gpu_id}" '
+                f'python "{turbine_dir}/iree/turbine/kernel/boo/driver/driver.py" '
+                f'--commands-file "{chunk_file.resolve()}" '
+                f'--csv "{part_csv.resolve()}" > /dev/null 2>&1 &'
+            )
+            launch_lines.append("PIDS+=($!)")
+        launch_lines.append("wait ${PIDS[@]}")
+        
+        parallel_script = f"""#!/bin/bash
+set -e
+export PATH="{iree_build_dir}/tools:$PATH"
+cd "{turbine_dir}"
+source .venv/bin/activate
+if [ -f .env ]; then source .env; export PYTHONPATH; fi
+
+{chr(10).join(launch_lines)}
+"""
+        script_path = self.results_dir / f"_run_parallel_{limit_value}.sh"
+        script_path.write_text(parallel_script)
+        script_path.chmod(0o755)
+        
+        # Launch the script and monitor progress
+        proc = subprocess.Popen(
+            ["/bin/bash", str(script_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        
+        all_part_csvs = [pc for pc in part_csvs]
+        while proc.poll() is None:
+            completed = 0
+            for pc in all_part_csvs:
+                if pc.exists():
+                    try:
+                        lines = pc.read_text().strip().split('\n')
+                        completed += max(0, len(lines) - 1)
+                    except:
+                        pass
+            print(f"\r  Running benchmark {completed}/{total} ...", end='', flush=True)
+            time.sleep(2)
+        
+        proc.wait()
+        script_path.unlink(missing_ok=True)
+        
+        # Merge per-GPU CSVs (keep header from first, strip from rest)
+        first = True
+        with open(csv_file, 'w') as out:
+            for pc in all_part_csvs:
+                if pc.exists():
+                    lines = pc.read_text().strip().split('\n')
+                    if first:
+                        out.write('\n'.join(lines) + '\n')
+                        first = False
+                    elif len(lines) > 1:
+                        out.write('\n'.join(lines[1:]) + '\n')
+        
+        # Clean up
+        for _, cf in chunk_files:
+            cf.unlink(missing_ok=True)
+        for pc in all_part_csvs:
+            pc.unlink(missing_ok=True)
+        
+        if csv_file.exists():
+            lines = csv_file.read_text().strip().split('\n')
+            if len(lines) >= 2:
+                print(f"\r  ✓ Benchmark complete ({len(lines)-1} tests across {num_gpus} GPUs)")
+                return csv_file
+        
+        print(f"\n  ✗ Benchmark failed")
+        return None
+    
+    def _run_benchmark_single_gpu(self, test_file: Path, csv_file: Path, limit_value: int, gpu_id: int) -> Optional[Path]:
+        """Run benchmark on a single GPU"""
         print(f"  Running benchmarks for {test_file.name}...")
         
-        # Create a bash script with proper environment setup
         setup_script = f"""#!/bin/bash
 set -e
-
-# Get absolute paths
 IREE_BUILD_DIR="{self.iree_build_dir.resolve()}"
 TURBINE_DIR="{self.turbine_dir.resolve()}"
 TEST_FILE="{test_file.resolve()}"
 CSV_FILE="{csv_file.resolve()}"
-
-# Setup IREE environment
 export PATH="$IREE_BUILD_DIR/tools:$PATH"
 export PYTHONPATH="$IREE_BUILD_DIR/compiler/bindings/python:$PYTHONPATH"
-
-# Set GPU
-export HIP_VISIBLE_DEVICES={self.gpu_id}
-export CUDA_VISIBLE_DEVICES={self.gpu_id}
-
-# Activate turbine venv and setup Python environment
+export HIP_VISIBLE_DEVICES={gpu_id}
+export CUDA_VISIBLE_DEVICES={gpu_id}
 cd "$TURBINE_DIR"
 source .venv/bin/activate
-
-# Source .env if it exists and export PYTHONPATH
 if [ -f .env ]; then
     source .env
     export PYTHONPATH
 fi
-
-# Run the benchmark
 python3 iree/turbine/kernel/boo/driver/driver.py \\
     --commands-file="$TEST_FILE" \\
     --csv="$CSV_FILE"
 """
         
         try:
-            # Write temporary script
             script_path = self.results_dir / f"_run_benchmark_{limit_value}.sh"
             script_path.write_text(setup_script)
             script_path.chmod(0o755)
             
-            # Execute the script
             result = subprocess.run(
                 ["/bin/bash", str(script_path)],
                 capture_output=True,
@@ -305,16 +410,12 @@ python3 iree/turbine/kernel/boo/driver/driver.py \\
                 timeout=3600
             )
             
-            # Clean up script
             script_path.unlink()
             
-            # Check if CSV file was created and has valid data
-            # Note: ROCTracer warnings may cause non-zero exit codes, but benchmarks still succeed
             if csv_file.exists():
                 try:
-                    # Verify CSV has header + at least one data line
                     lines = csv_file.read_text().strip().split('\n')
-                    if len(lines) >= 2:  # header + at least 1 result
+                    if len(lines) >= 2:
                         print(f"  ✓ Benchmark complete ({len(lines)-1} tests)")
                         if result.returncode != 0:
                             print(f"  ⚠️  Warning: Non-zero exit code ({result.returncode}), but CSV is valid")
@@ -361,7 +462,9 @@ def main():
     parser.add_argument('--turbine-dir', required=True, help='Path to iree-turbine directory')
     parser.add_argument('--results-dir', required=True, help='Directory to save results')
     parser.add_argument('--test-files', nargs='+', required=True, help='Test files to benchmark')
-    parser.add_argument('--gpu-id', type=int, default=5, help='GPU ID to use')
+    parser.add_argument('--gpu-id', type=int, default=5, help='GPU ID to use (single GPU)')
+    parser.add_argument('--gpu-ids', type=str, default=None,
+                       help='Comma-separated GPU IDs for multi-GPU parallelism (e.g. "2,3,4,5,6,7")')
     parser.add_argument('--limit', type=int, help='Single limitParallelLoops value to test (omit for baseline)')
     parser.add_argument('--baseline', action='store_true',
                        help='Run baseline test without modifying C++ code')
@@ -398,6 +501,10 @@ def main():
         args.results_dir
     )
     optimizer.gpu_id = args.gpu_id
+    if args.gpu_ids:
+        optimizer.gpu_ids = [int(x) for x in args.gpu_ids.split(',')]
+    else:
+        optimizer.gpu_ids = [args.gpu_id]
     
     try:
         # Test files
